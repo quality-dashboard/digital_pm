@@ -10,3 +10,8 @@ backgroundColor = "#F5F7FA"
 secondaryBackgroundColor = "#FFFFFF"
 textColor = "#1E293B"
 font = "sans serif"
+
+[client]
+# 关闭页面上的异常详情：公网用户只能看到固定中文提示，
+# 不暴露文件路径、Python 堆栈或内部实现。
+showErrorDetails = false

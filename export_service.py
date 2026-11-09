@@ -35,6 +35,43 @@ def _safe_name(text: str, fallback: str = "project", limit: int = 40) -> str:
     return (cleaned or fallback)[:limit]
 
 
+def build_zip_from_tickets(
+    tickets: list[dict],
+    project_name: str = "project",
+) -> tuple[bytes, str]:
+    """用内存中的工单数据生成 ZIP（数据库暂不可用时的兜底）。
+
+    入参 tickets 的每项至少包含 filename 与 content_md；
+    与 build_tickets_zip 共用同一套打包规则。
+    """
+    if not tickets:
+        raise ExportError("暂无工单可下载")
+
+    safe_project = _safe_name(project_name)
+    buffer = io.BytesIO()
+    try:
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for ticket in tickets:
+                filename = _safe_name(
+                    ticket.get("filename", ""),
+                    fallback="ticket.md",
+                    limit=80,
+                )
+                if not filename.lower().endswith(".md"):
+                    filename += ".md"
+                # 统一放进 {项目名}/.tasks/，解压后就是一个可直接交给 IDE 的文件夹
+                archive.writestr(
+                    f"{safe_project}/.tasks/{filename}",
+                    ticket.get("content_md", ""),
+                )
+    except Exception:
+        # 固定提示，不把打包底层异常返回页面
+        raise ExportError("打包 ZIP 失败，请稍后重试") from None
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    return buffer.getvalue(), f"{safe_project}_tickets_{stamp}.zip"
+
+
 def build_tickets_zip(project_id: str) -> tuple[bytes, str]:
     """从数据库拉取项目全部工单，在内存生成 ZIP。
 
@@ -49,26 +86,4 @@ def build_tickets_zip(project_id: str) -> tuple[bytes, str]:
     if not tickets:
         raise ExportError("当前项目还没有工单，无法导出")
 
-    project_name = _safe_name(project.get("name", "project"))
-    buffer = io.BytesIO()
-
-    try:
-        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for ticket in tickets:
-                filename = _safe_name(
-                    ticket.get("filename", ""),
-                    fallback="ticket.md",
-                    limit=80,
-                )
-                if not filename.lower().endswith(".md"):
-                    filename += ".md"
-                # 统一放进 {项目名}/.tasks/，解压后就是一个可直接交给 IDE 的文件夹
-                archive.writestr(
-                    f"{project_name}/.tasks/{filename}",
-                    ticket.get("content_md", ""),
-                )
-    except Exception as exc:
-        raise ExportError(f"打包 ZIP 失败：{type(exc).__name__}: {exc}") from exc
-
-    stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    return buffer.getvalue(), f"{project_name}_tickets_{stamp}.zip"
+    return build_zip_from_tickets(tickets, project.get("name", "project"))

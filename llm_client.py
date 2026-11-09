@@ -1,29 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-llm_client.py —— 阿里云百炼（DashScope）调用封装
+llm_client.py —— 阿里云百炼（DashScope）调用封装（V3.3.0 多模型兜底）
 
 两个入口：
 - chat_json：需要结构化结果（追问、大纲），强制 JSON 模式并解析；
 - chat_text：需要 Markdown 正文（工单、Fix 工单），直接返回文本。
 
-关键约定：
-- 每次调用都由 config.build_system_prompt() 把「协作偏好 + 技术红线」拼在
-  System Prompt 最前面，调用方不需要、也不允许绕过；
-- 密钥只从环境变量读取，不打印、不落盘、不进入异常文本；
-- httpx 延迟导入：没装第三方包时，UI 仍能启动并给出明确安装提示。
+多模型兜底：
+- 模型池按 qwen-plus -> qwen-turbo -> qwen-max 顺序尝试；
+- 任一模型遇到 429/5xx/网络异常，sleep 1 秒后切下一个，避免用户卡死；
+- 全部失败只返回固定中文提示，页面不暴露底层异常与路径。
+
+安全约定：
+- 密钥只从环境变量 / Streamlit Secrets 读取，不打印、不落盘、不进异常文本；
+- 页面可见的异常 message 一律是中文短提示，详细原因只写服务端日志。
 """
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 
 import config
 
+# 模型池：Plus 性价比最高；失败后切 Turbo；最后 Max 兜底。
+# 如果环境变量 DASHSCOPE_MODEL 显式配置了其他模型，会放在池子最前面。
+MODELS: tuple[str, ...] = ("qwen-plus", "qwen-turbo", "qwen-max")
+
+# 页面统一展示的友好提示：不包含 HTTP 状态码、路径、堆栈
+FRIENDLY_ERROR = "AI 服务当前繁忙，请稍后重试"
+
 
 class LLMError(RuntimeError):
-    """百炼调用或解析失败的统一异常。"""
+    """百炼调用或解析失败的统一异常（message 必须是可展示的中文提示）。"""
 
 
 class MissingAPIKeyError(LLMError):
@@ -40,15 +49,23 @@ def is_configured() -> bool:
     return bool(get_api_key())
 
 
-def _post(system_prompt: str, user_content: str, json_mode: bool) -> str:
-    """发送一次 chat/completions 请求，返回助手文本。"""
+def _model_pool() -> list[str]:
+    """模型池：用户显式配置的模型优先，其余按 MODELS 顺序补位，去重。"""
+    configured = (config.DASHSCOPE_MODEL or "").strip()
+    ordered: list[str] = [configured] if configured else []
+    ordered.extend(model for model in MODELS if model not in ordered)
+    return ordered
+
+
+def _post(system_prompt: str, user_content: str, json_mode: bool, model: str) -> str:
+    """用指定模型发送一次 chat/completions 请求，返回助手文本。"""
     try:
         import httpx
-    except ImportError as exc:
-        raise LLMError("缺少 httpx，请先执行：python -m pip install -r requirements.txt") from exc
+    except ImportError:
+        raise LLMError("AI 服务组件缺失，请联系管理员") from None
 
     payload: dict = {
-        "model": config.DASHSCOPE_MODEL,
+        "model": model,
         "messages": [
             # 规则注入在这里发生：每次请求都强制带上协作偏好与技术红线
             {"role": "system", "content": config.build_system_prompt(system_prompt)},
@@ -64,49 +81,48 @@ def _post(system_prompt: str, user_content: str, json_mode: bool) -> str:
         "Authorization": f"Bearer {get_api_key()}",
         "Content-Type": "application/json",
     }
+
     try:
         with httpx.Client(timeout=config.LLM_TIMEOUT) as client:
             response = client.post(url, headers=headers, json=payload)
-    except Exception as exc:  # 超时、DNS、连接重置等统一转换
-        raise LLMError(f"连接百炼失败：{type(exc).__name__}: {exc}") from exc
+            # 兼容不支持 response_format 的网关：400 时去掉该参数重试一次
+            if response.status_code == 400 and json_mode:
+                payload.pop("response_format", None)
+                response = client.post(url, headers=headers, json=payload)
+    except Exception as exc:
+        # 内部细节只写服务端日志，不进入页面
+        print(f"[llm] {model} 网络异常：{type(exc).__name__}: {str(exc)[:160]}")
+        raise LLMError("连接 AI 服务失败") from None
 
     if response.status_code >= 400:
-        # 只回显前 300 字符，避免把完整响应（可能含敏感回显）打进日志
-        raise LLMError(f"百炼返回 HTTP {response.status_code}：{response.text[:300]}")
+        print(f"[llm] {model} HTTP {response.status_code}：{response.text[:200]}")
+        raise LLMError("AI 服务返回错误")
 
     try:
         body = response.json()
         return body["choices"][0]["message"]["content"]
     except (ValueError, KeyError, IndexError, TypeError) as exc:
-        raise LLMError(f"百炼返回结构异常：{str(response.text)[:300]}") from exc
+        print(f"[llm] {model} 返回结构异常：{type(exc).__name__}")
+        raise LLMError("AI 返回结构异常") from None
 
 
 def _call(system_prompt: str, user_content: str, json_mode: bool) -> str:
-    """带重试与 response_format 兼容降级的统一调用。"""
+    """带多模型 fallback 的统一调用：任一模型失败，sleep(1) 后切下一个。"""
     if not is_configured():
-        raise MissingAPIKeyError(
-            f"未配置 {config.DASHSCOPE_API_KEY_ENV}，无法调用千问。"
-            "请在 .env 或环境变量中填写百炼密钥后重启页面。"
-        )
+        raise MissingAPIKeyError("未配置 AI 密钥，请联系管理员")
 
     last_error: Exception | None = None
-    disable_json_mode = False
-    for attempt in range(1, config.LLM_MAX_ATTEMPTS + 1):
+    for model in _model_pool():
         try:
-            return _post(
-                system_prompt,
-                user_content,
-                json_mode=json_mode and not disable_json_mode,
-            )
+            return _post(system_prompt, user_content, json_mode, model)
         except LLMError as exc:
             last_error = exc
-            # 部分网关不支持 response_format：收到 400 后自动去掉参数，靠提示词约束 JSON
-            if json_mode and "HTTP 400" in str(exc):
-                disable_json_mode = True
-            if attempt < config.LLM_MAX_ATTEMPTS:
-                time.sleep(min(1.0 * attempt, 3.0))
+            print(f"[llm] {model} 失败，切换下一个模型：{str(exc)[:120]}")
+            time.sleep(1)  # 按产品经理要求：失败后等待 1 秒再切
 
-    raise LLMError(f"百炼调用失败（共 {config.LLM_MAX_ATTEMPTS} 次）：{last_error}")
+    # 所有模型都失败：只给固定提示，绝不把底层异常/路径抛给页面
+    print(f"[llm] 模型池全部失败：{type(last_error).__name__ if last_error else 'unknown'}")
+    raise LLMError(FRIENDLY_ERROR)
 
 
 def _extract_json(text: str) -> dict:
@@ -118,27 +134,28 @@ def _extract_json(text: str) -> dict:
 
     start, end = cleaned.find("{"), cleaned.rfind("}")
     if start == -1 or end <= start:
-        raise LLMError(f"模型输出中未找到 JSON：{cleaned[:200]}")
+        raise LLMError("AI 返回格式异常")
 
     try:
         data = json.loads(cleaned[start : end + 1])
-    except json.JSONDecodeError as exc:
-        raise LLMError(f"模型输出不是合法 JSON：{exc}") from exc
+    except json.JSONDecodeError:
+        raise LLMError("AI 返回格式异常") from None
     if not isinstance(data, dict):
-        raise LLMError("模型输出 JSON 顶层必须是对象")
+        raise LLMError("AI 返回格式异常")
     return data
 
 
 def chat_json(system_prompt: str, user_content: str) -> dict:
     """要求模型返回 JSON 对象（追问 / 大纲阶段使用）。"""
-    return _extract_json(_call(system_prompt, user_content, json_mode=True))
+    text = _call(system_prompt, user_content, json_mode=True)
+    return _extract_json(text)
 
 
 def chat_text(system_prompt: str, user_content: str) -> str:
     """要求模型返回 Markdown 正文（工单 / Fix 工单使用）。"""
     text = _call(system_prompt, user_content, json_mode=False).strip()
     if not text:
-        raise LLMError("模型返回内容为空")
+        raise LLMError("AI 返回内容为空，请重试")
     if len(text) > config.MAX_TICKET_CHARS:
         # 截断只是兜底保护；正常工单应远小于上限
         text = text[: config.MAX_TICKET_CHARS] + "\n\n> （内容超出上限，已截断）"

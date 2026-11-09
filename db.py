@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 
 import config
 
@@ -57,6 +58,12 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         created_at  TEXT NOT NULL,
         UNIQUE (project_id, filename),
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS quota_daily (
+        date   TEXT PRIMARY KEY,
+        count  INTEGER NOT NULL DEFAULT 0
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_projects_session ON projects(session_id, created_at)",
@@ -109,13 +116,6 @@ class Database:
                     "缺少 libsql，请执行：python -m pip install libsql"
                 ) from exc
 
-            # 临时诊断日志（排查完可删）：
-            # URL 不是密钥，完整打印；Token 只打印前 10 位与长度，绝不打印完整值。
-            print(
-                f"[db] 尝试连接 Turso：url={config.TURSO_DATABASE_URL} "
-                f"token={config.TURSO_AUTH_TOKEN[:10]}... "
-                f"token_len={len(config.TURSO_AUTH_TOKEN)}"
-            )
             # 官方推荐写法：libsql.connect(database=..., auth_token=...)
             # timeout 给 15 秒，兼顾 Turso 冷启动与网络抖动
             self._conn = libsql.connect(
@@ -144,7 +144,30 @@ class Database:
         self._backend = "sqlite"
         self._conn = None
         self._schema_ready = False
-        print(f"[db] Turso 连接失败，已降级本地 SQLite：{self.fallback_reason}")
+        # 只记录降级事件，不打印异常详情（可能包含 URL / 驱动内部信息）
+        print("[db] Turso 连接失败，已降级本地 SQLite")
+
+    def _cleanup_expired(self) -> None:
+        """静默清理 30 天前的项目数据（隐私承诺在数据库侧真正落实）。
+
+        - 先删 tickets 再删 projects，兼容未开启外键级联的环境；
+        - datetime(created_at) 兼容 ISO8601 的 T 与 +00:00，比直接字符串比较准确；
+        - 清理失败只写服务端日志，不阻塞用户操作。
+        """
+        try:
+            self.execute(
+                "DELETE FROM tickets WHERE project_id IN ("
+                "SELECT id FROM projects "
+                "WHERE datetime(created_at) < datetime('now', '-30 day')"
+                ")"
+            )
+            self.execute(
+                "DELETE FROM projects "
+                "WHERE datetime(created_at) < datetime('now', '-30 day')"
+            )
+        except Exception as exc:
+            # 只记录异常类型，不打印可能含连接串的错误详情
+            print(f"[db] 过期数据清理失败：{type(exc).__name__}")
 
     def init_schema(self) -> None:
         """幂等建表；Turso 失败时自动降级到本地 SQLite 并继续建表。"""
@@ -168,8 +191,12 @@ class Database:
                         self._conn.execute(statement)
                     self._conn.commit()
                     self._schema_ready = True
+                    self._cleanup_expired()
                     return
                 raise
+
+        # 建表成功后执行一次 30 天清理（每次进程首次连接执行一次）
+        self._cleanup_expired()
 
     # ------------------------------------------------------------------
     # 统一读写接口（libsql 与 sqlite3 都是 DB-API，逻辑完全复用）
@@ -191,6 +218,32 @@ class Database:
             rows = cursor.fetchall()
             columns = [item[0] for item in (cursor.description or [])]
             return [dict(zip(columns, row)) for row in rows]
+
+    # ------------------------------------------------------------------
+    # 每日全局配额（防刷爆 API 额度）
+    # ------------------------------------------------------------------
+    def consume_quota(self, limit: int = 100) -> tuple[bool, int]:
+        """检查并递增今日全局配额，返回 (是否允许, 今日已用次数)。
+
+        - 日期按北京时间（UTC+8）切分，避免云端 UTC 与用户本地差 8 小时；
+        - 并发下可能多放行几次，但对「防刷爆额度」足够；真正的资损保护
+          还有按钮锁与后端幂等；
+        - 达到上限时不写入，直接返回 False。
+        """
+        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        self.init_schema()
+        rows = self.query("SELECT count FROM quota_daily WHERE date = ?", (today,))
+        used = int(rows[0]["count"]) if rows else 0
+        if used >= limit:
+            return False, used
+
+        # UPSERT：当天第一次插入 1，之后累加；参数全部绑定
+        self.execute(
+            "INSERT INTO quota_daily (date, count) VALUES (?, 1) "
+            "ON CONFLICT(date) DO UPDATE SET count = count + 1",
+            (today,),
+        )
+        return True, used + 1
 
     # ------------------------------------------------------------------
     # 健康检查

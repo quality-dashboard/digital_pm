@@ -85,17 +85,21 @@ if "session_id" not in st.session_state:
     st.session_state["session_id"] = config.new_session_id()
 session_id: str = st.session_state["session_id"]
 
+# 生成中的重入拦截：用户刷新/重跑时直接停止，避免重复调用模型扣费
+if st.session_state.get("busy_phase"):
+    st.info("正在生成中，请稍候……")
+    st.stop()
+
 # 初始化数据库：Turso 连不上会自动降级到本地 SQLite，先保证页面可用
 try:
     db.db.init_schema()
-except Exception as exc:
-    st.error("数据库初始化失败，页面无法继续。")
-    st.caption(f"{type(exc).__name__}: {exc}")
+except Exception:
+    # 固定文案：不显示路径、异常类型或堆栈
+    st.error("数据库初始化失败，请联系管理员或稍后重试。")
     st.stop()
 
 if db.db.fallback_reason:
     st.warning("云端连不上，已切换本地模式（数据暂存本地 SQLite，排查后再切回 Turso）")
-    st.caption(f"降级原因：{db.db.fallback_reason[:300]}")
 
 
 def _session() -> decompose_logic.PMSession | None:
@@ -106,6 +110,50 @@ def _session() -> decompose_logic.PMSession | None:
 def _store(session: decompose_logic.PMSession) -> None:
     """写回对话状态。"""
     st.session_state["pm_session"] = session
+
+
+# 只有业务层精心构造的中文提示可以直接展示；
+# 其他异常（数据库驱动、网络、未知错误）统一用固定文案，避免泄露路径/堆栈。
+_SAFE_ERRORS = (
+    decompose_logic.LogicError,
+    export_service.ExportError,
+    db.DatabaseError,
+    llm_client.LLMError,
+)
+
+
+def _error_text(exc: Exception, fallback: str = "操作失败，请稍后重试") -> str:
+    """把异常转换成页面可展示的短中文提示。"""
+    if isinstance(exc, _SAFE_ERRORS):
+        message = str(exc).strip()
+        return message[:300] if message else fallback
+    return fallback
+
+
+def _begin_busy(phase: str) -> None:
+    """标记当前步骤正在生成，防止连点与刷新重入导致重复扣费。"""
+    st.session_state["busy_phase"] = phase
+
+
+def _end_busy() -> None:
+    """生成结束（成功或失败）后释放锁。"""
+    st.session_state.pop("busy_phase", None)
+
+
+def _is_busy() -> bool:
+    """当前是否有生成任务在跑；用于按钮 disabled。"""
+    return bool(st.session_state.get("busy_phase"))
+
+
+def _quota_guard() -> None:
+    """全局每日配额：超过 100 次直接拦截，保护 API 额度。
+
+    配额按北京时间切分；只有真正要调用大模型时才消耗次数。
+    """
+    allowed, _used = db.db.consume_quota(limit=100)
+    if not allowed:
+        st.error("今日免费体验名额已满，请明天再来～")
+        st.stop()
 
 
 def _active_project_id(selected: str) -> str:
@@ -185,18 +233,45 @@ def render_conversation() -> None:
             st.caption("（模型原本给了多个问句，已自动收敛为 1 个）")
 
         answer = st.text_input("你的回答", key=f"answer_input_{session.round}")
-        if st.button("提交回答", type="primary"):
+        if st.button("提交回答", type="primary", disabled=_is_busy()):
             if not answer.strip():
                 st.warning("回答不能为空")
             else:
+                _quota_guard()
+                _begin_busy("answer")
+                ok = False
                 with st.spinner("已记录，正在判断是否还需要追问……"):
                     try:
                         session.answer(answer.strip())
                         _store(session)
-                        # 全量刷新：侧边栏进度条与 Header 阶段需要同步更新
-                        st.rerun()
+                        ok = True
                     except Exception as exc:
-                        st.error(f"提交失败：{type(exc).__name__}: {exc}")
+                        st.error(_error_text(exc, "提交失败，请稍后重试"))
+                    finally:
+                        _end_busy()
+                if ok:
+                    # 全量刷新：侧边栏进度条与 Header 阶段需要同步更新
+                    st.rerun()
+
+        # 逃生门：不想继续被追问，直接进入大纲阶段（仍会消耗一次配额）
+        if st.button(
+            "赶时间？跳过追问，直接生成大纲 →",
+            disabled=_is_busy(),
+            key=f"skip_clarify_{session.round}",
+        ):
+            _quota_guard()
+            _begin_busy("skip")
+            ok = False
+            try:
+                session.skip_clarify()
+                _store(session)
+                ok = True
+            except Exception as exc:
+                st.error(_error_text(exc, "跳过失败，请稍后重试"))
+            finally:
+                _end_busy()
+            if ok:
+                st.rerun()
     elif session.phase in (
         config.PHASE_OUTLINE,
         config.PHASE_CONFIRMED,
@@ -205,13 +280,75 @@ def render_conversation() -> None:
         st.success("追问已完成，信息足够，请去「② 大纲确认」。")
 
 
+@st.fragment
+def render_requirement_form() -> None:
+    """首屏引导 + 需求输入 + 合规勾选。
+
+    包进 fragment：输入需求时只重跑这一块，字数统计实时更新，不整页闪烁。
+    """
+    with st.container(border=True):
+        st.markdown("### 一句话想法，5 张可开工的工单。")
+        st.caption(
+            "① 描述产品想法 → ② AI 帮你追问细节 → "
+            "③ 生成结构化 Markdown 工单，直接丢给开发者或 AI 编码助手。"
+        )
+
+    requirement = st.text_area(
+        "需求描述（模糊也可以，我来追问）",
+        height=160,
+        key="requirement_input",
+        max_chars=8000,
+        placeholder="例如：做一个简历优化工具，能上传简历并给出修改建议……",
+    )
+    st.caption(f"已输入 {len(requirement)} / 8000 字")
+
+    project_name_input = st.text_input(
+        "项目名（可选，留空则由大纲自动命名）",
+        key="project_name_input",
+    )
+
+    agree = st.checkbox(
+        "我已阅读并同意：本工具会保存你的需求记录 30 天用于进度恢复，不会收集您的个人身份信息。",
+        key="consent_agree",
+    )
+
+    if st.button(
+        "初步分析",
+        type="primary",
+        disabled=_is_busy() or not agree,
+        use_container_width=True,
+    ):
+        if not requirement.strip():
+            st.warning("请先填写需求描述")
+        else:
+            _quota_guard()
+            _begin_busy("clarify")
+            ok = False
+            with st.spinner("正在分析需求盲点……"):
+                try:
+                    session = decompose_logic.PMSession(
+                        requirement=requirement.strip(),
+                        project_name=project_name_input.strip(),
+                        session_id=session_id,
+                    )
+                    session.start()
+                    _store(session)
+                    st.session_state.pop("restored_from", None)
+                    ok = True
+                except Exception as exc:
+                    st.error(_error_text(exc, "分析失败，请稍后重试"))
+                finally:
+                    _end_busy()
+            if ok:
+                st.rerun()
+
+
 # 首次加载：按 session_id 从数据库恢复最近项目（项目级状态，不含对话）
 if "pm_session" not in st.session_state:
     try:
         _recent_projects = project_store.repo.list_projects(session_id, limit=1)
-    except Exception as exc:
-        st.error("数据库连接失败，请检查 TURSO_DATABASE_URL / TURSO_AUTH_TOKEN 或本地 SQLite 权限。")
-        st.caption(f"错误详情：{type(exc).__name__}: {exc}")
+    except Exception:
+        st.error("数据库连接失败，请联系管理员或稍后重试。")
         st.stop()
 
     if _recent_projects:
@@ -253,9 +390,8 @@ with st.sidebar:
     st.subheader("项目")
     try:
         _projects = project_store.repo.list_projects(session_id, limit=50)
-    except Exception as exc:
-        st.error("读取项目列表失败")
-        st.caption(f"{type(exc).__name__}: {exc}")
+    except Exception:
+        st.error("读取项目列表失败，请稍后重试。")
         st.stop()
 
     _options = ["（新建项目）"] + [item["id"] for item in _projects]
@@ -301,36 +437,8 @@ tab_ask, tab_outline, tab_tickets, tab_bug = st.tabs(
 # ① 需求与追问
 # =============================================================================
 with tab_ask:
-    requirement = st.text_area(
-        "需求描述（模糊也可以，我来追问）",
-        height=160,
-        key="requirement_input",
-        placeholder="例如：做一个简历优化工具，能上传简历并给出修改建议……",
-    )
-    project_name_input = st.text_input(
-        "项目名（可选，留空则由大纲自动命名）",
-        key="project_name_input",
-    )
-
-    if st.button("初步分析", type="primary"):
-        if not requirement.strip():
-            st.warning("请先填写需求描述")
-        else:
-            with st.spinner("正在分析需求盲点……"):
-                try:
-                    session = decompose_logic.PMSession(
-                        requirement=requirement.strip(),
-                        project_name=project_name_input.strip(),
-                        session_id=session_id,
-                    )
-                    session.start()
-                    _store(session)
-                    st.session_state.pop("restored_from", None)
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"分析失败：{type(exc).__name__}: {exc}")
-
-    # 对话流整块交给 fragment：输入回答只重跑本块，提交后全量刷新
+    # 输入区与对话流都走 fragment：输入/回答只重跑局部，减少整页闪烁
+    render_requirement_form()
     render_conversation()
 
 # =============================================================================
@@ -343,14 +451,21 @@ with tab_outline:
     elif session.outline is None:
         if session.phase == config.PHASE_CLARIFY and session.pending_question is not None:
             st.caption("请先回答当前追问，再生成大纲。")
-        elif st.button("生成大纲", type="primary"):
+        elif st.button("生成大纲", type="primary", disabled=_is_busy()):
+            _quota_guard()
+            _begin_busy("outline")
+            ok = False
             with st.spinner("正在生成 3~4 个模块的大纲……"):
                 try:
                     session.build_outline()
                     _store(session)
-                    st.rerun()
+                    ok = True
                 except Exception as exc:
-                    st.error(f"生成大纲失败：{type(exc).__name__}: {exc}")
+                    st.error(_error_text(exc, "生成大纲失败，请稍后重试"))
+                finally:
+                    _end_busy()
+            if ok:
+                st.rerun()
     else:
         outline = session.outline
         st.subheader(f"项目大纲：{outline.project_name}")
@@ -374,14 +489,20 @@ with tab_outline:
             st.info(f"需要前置调研：{outline.research_goal or '（未写具体目标）'}")
 
         if not session.outline_confirmed:
-            if st.button("确认大纲无误", type="primary"):
+            if st.button("确认大纲无误", type="primary", disabled=_is_busy()):
+                _begin_busy("confirm")
+                ok = False
                 with st.spinner("正在写入项目上下文……"):
                     try:
                         session.confirm_outline()
                         _store(session)
-                        st.rerun()
+                        ok = True
                     except Exception as exc:
-                        st.error(f"确认失败：{type(exc).__name__}: {exc}")
+                        st.error(_error_text(exc, "确认失败，请稍后重试"))
+                    finally:
+                        _end_busy()
+                if ok:
+                    st.rerun()
         else:
             st.success(
                 f"大纲已确认，项目已写入数据库（{db.db.backend}）"
@@ -392,18 +513,48 @@ with tab_outline:
 # =============================================================================
 @st.fragment
 def render_ticket_board(project_id: str) -> None:
-    """看板只从数据库读取；ZIP 在内存生成，不依赖本地磁盘。"""
-    project = project_store.repo.get_project(project_id)
+    """看板优先读数据库；数据库暂不可用时用本次会话的内存工单兜底。"""
+    project = None
+    tickets: list[dict] = []
+    db_error = False
+    try:
+        project = project_store.repo.get_project(project_id)
+        tickets = project_store.repo.list_tickets(project_id)
+    except Exception:
+        # 云端超时/不可用：不报错，走内存兜底
+        db_error = True
+
+    # 只使用与当前项目匹配的内存工单，避免串项目
+    memory_tickets = (
+        list(st.session_state.get("tickets", []))
+        if st.session_state.get("tickets_project_id") == project_id
+        else []
+    )
+    if (db_error or not tickets) and memory_tickets:
+        tickets = memory_tickets
+        project = project or {"name": st.session_state.get("project_name", "当前项目")}
+        st.warning("云端暂存失败，请立即下载 ZIP 保存到本地")
+
+    # 生成时记录的警告只显示一次
+    warning = st.session_state.pop("cloud_sync_warning", "")
+    if warning:
+        st.warning(warning)
+
     if not project:
         st.caption("项目不存在或已被删除。")
         return
 
-    tickets = project_store.repo.list_tickets(project_id)
     st.subheader(f"工单看板：{project['name']}（{len(tickets)} 张）")
 
     if not tickets:
         st.caption("当前项目还没有工单。")
         return
+
+    # 微信生态兜底：微信内置浏览器经常拦截 ZIP 下载
+    st.info(
+        "📱 手机用户请注意：在微信内可能无法直接下载 ZIP。"
+        "若点击无反应，请点右上角『···』选择『在浏览器打开』。"
+    )
 
     # 双列卡片展示工单头部；详情仍用 expander + Markdown，保留语法高亮
     ticket_columns = st.columns(2)
@@ -418,7 +569,7 @@ def render_ticket_board(project_id: str) -> None:
                         "name": item["filename"],
                         "kind": item["type"],
                         "depends_on": _depends_from_content(item["content_md"]),
-                        "updated_at": item["created_at"],
+                        "updated_at": item.get("created_at", ""),
                     }
                 ),
                 unsafe_allow_html=True,
@@ -427,19 +578,38 @@ def render_ticket_board(project_id: str) -> None:
                 # 详情保持原生 Markdown 渲染，代码高亮与转义由 Streamlit 负责
                 st.markdown(item["content_md"])
 
-    # 杀手锏：内存打包 ZIP，点击直接下载
-    try:
-        zip_bytes, zip_name = export_service.build_tickets_zip(project_id)
-        st.download_button(
-            "📥 下载全部工单 (.zip)",
-            data=zip_bytes,
-            file_name=zip_name,
-            mime="application/zip",
-            key=f"download_zip_{project_id}",
-            use_container_width=True,
-        )
-    except export_service.ExportError as exc:
-        st.caption(f"暂不可导出：{exc}")
+    # 防空守卫：优先用内存数据打包；无工单或 ZIP 太小都禁用下载
+    zip_bytes = b""
+    zip_name = f"{project.get('name', 'project')}_tickets.zip".replace(" ", "-")
+    if tickets:
+        try:
+            if db_error or memory_tickets:
+                zip_bytes, zip_name = export_service.build_zip_from_tickets(
+                    tickets, project.get("name", "project")
+                )
+            else:
+                zip_bytes, zip_name = export_service.build_tickets_zip(project_id)
+        except export_service.ExportError:
+            zip_bytes = b""
+
+    download_ready = bool(tickets) and len(zip_bytes) >= 100
+    st.download_button(
+        "📥 下载全部工单 (.zip)",
+        data=zip_bytes if download_ready else b"",
+        file_name=zip_name,
+        mime="application/zip",
+        key=f"download_zip_{project_id}",
+        use_container_width=True,
+        disabled=not download_ready,
+    )
+    if not download_ready:
+        st.caption("暂无工单可下载")
+
+    # 微信/手机下载兜底：直接把工单全文摊开，可逐张复制
+    with st.expander("👇 若无法下载，请直接在此复制工单全文"):
+        for item in tickets:
+            st.markdown(f"**{item['filename']}**")
+            st.code(item["content_md"], language="markdown")
 
     # 点击后 fragment 自身重跑，完成刷新，不触发整页重算
     st.button("刷新列表", key=f"refresh_tickets_{project_id}")
@@ -451,7 +621,11 @@ with tab_tickets:
 
     if session and session.outline_confirmed and session.project_id == active_project_id:
         # 只统计主工单（排除 fix_*.md）：已有主工单就禁止重复生成
-        existing = project_store.repo.ticket_count(active_project_id, exclude_fix=True)
+        try:
+            existing = project_store.repo.ticket_count(active_project_id, exclude_fix=True)
+        except Exception:
+            # 数据库暂不可用时不拦生成，后面用内存兜底
+            existing = 0
         if existing:
             st.warning(
                 f"工单已存在（{existing} 张主工单），已禁止重复生成。"
@@ -460,18 +634,34 @@ with tab_tickets:
         if st.button(
             "一键生成工单",
             type="primary",
-            disabled=existing > 0,
+            disabled=existing > 0 or _is_busy(),
             key="generate_tickets_btn",
         ):
-            with st.spinner("正在逐模块生成工单，可能需要 20~60 秒……"):
+            _quota_guard()
+            _begin_busy("tickets")
+            ok = False
+            with st.status("正在生成工单...", expanded=True) as status:
                 try:
-                    paths = session.generate_tickets()
+                    paths = session.generate_tickets(
+                        progress=lambda message: status.update(label=message)
+                    )
                     _store(session)
-                    st.success(f"已生成 {len(paths)} 张工单，并已写入数据库")
-                    st.rerun()
+                    # 内存兜底：数据库超时也能下载
+                    st.session_state["tickets"] = list(session.generated_ticket_data)
+                    st.session_state["tickets_project_id"] = session.project_id
+                    if session.db_sync_failed:
+                        st.session_state["cloud_sync_warning"] = (
+                            "云端暂存失败，请立即下载 ZIP 保存到本地"
+                        )
+                    status.update(label="工单生成完成", state="complete", expanded=False)
+                    ok = True
                 except Exception as exc:
-                    # 幂等拦截 / 生成锁冲突 / 数据库写入失败都会走到这里
-                    st.error(f"生成工单失败：{type(exc).__name__}: {exc}")
+                    status.update(label="生成失败", state="error")
+                    st.error(_error_text(exc, "生成工单失败，请稍后重试"))
+                finally:
+                    _end_busy()
+            if ok:
+                st.rerun()
     elif session and not session.outline_confirmed:
         st.caption("请先在「② 大纲确认」点击「确认大纲无误」。")
 
@@ -495,10 +685,13 @@ with tab_bug:
             key="bug_log_input",
             placeholder="粘贴 Trae / CodeBuddy 里的完整报错堆栈……",
         )
-        if st.button("生成 Fix 工单", type="primary"):
+        if st.button("生成 Fix 工单", type="primary", disabled=_is_busy()):
             if not log_text.strip():
                 st.warning("请先粘贴报错日志")
             else:
+                _quota_guard()
+                _begin_busy("fix")
+                ok = False
                 with st.spinner("正在结合项目上下文生成修复工单……"):
                     try:
                         slug = _project_slug(active_project_id) or active_project_id
@@ -507,7 +700,12 @@ with tab_bug:
                             log_text,
                             project_id=active_project_id,
                         )
-                        st.success(f"已生成：{path}")
+                        st.success(f"已生成：{path.name}")
                         st.markdown(path.read_text(encoding="utf-8", errors="replace"))
+                        ok = True
                     except Exception as exc:
-                        st.error(f"生成失败：{type(exc).__name__}: {exc}")
+                        st.error(_error_text(exc, "生成失败，请稍后重试"))
+                    finally:
+                        _end_busy()
+                if ok:
+                    st.rerun()

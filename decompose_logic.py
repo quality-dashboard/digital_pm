@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -50,6 +51,9 @@ class PMSession:
     outline: Outline | None = None
     outline_confirmed: bool = False
     generated_tickets: list[str] = field(default_factory=list)
+    # V3.3.1：内存兜底数据（数据库暂存失败时用于生成 ZIP），不写入 JSON 快照
+    generated_ticket_data: list[dict] = field(default_factory=list)
+    db_sync_failed: bool = False
 
     # ------------------------------------------------------------------
     # 状态持久化（V5.1）：会话 <-> 可落盘 dict
@@ -177,22 +181,24 @@ class PMSession:
             phase=self.phase,
         )
 
-    def _persist_ticket(self, path: Path, ticket_type: str) -> None:
-        """把本地工单同步进数据库；数据库失败时回滚本地文件，保证两边一致。"""
-        self._ensure_project()
+    def _persist_ticket(self, path: Path, ticket_type: str, content_md: str) -> bool:
+        """把工单写入数据库；失败只做标记，不拦用户（本地/内存仍可导出）。
+
+        返回 True 表示入库成功；False 表示已降级为本地/内存兜底。
+        """
         try:
+            self._ensure_project()
             project_store.repo.add_ticket(
                 project_id=self.project_id,
                 ticket_type=ticket_type,
                 filename=path.name,
-                content_md=path.read_text(encoding="utf-8"),
+                content_md=content_md,
             )
+            return True
         except Exception as exc:
-            # 避免出现「本地有、云端没有」的半成功状态：删掉刚写的文件再报错
-            path.unlink(missing_ok=True)
-            raise LogicError(
-                f"工单写入数据库失败：{type(exc).__name__}: {exc}"
-            ) from exc
+            print(f"[pm] 工单入库失败（已转内存兜底）：{type(exc).__name__}: {str(exc)[:160]}")
+            self.db_sync_failed = True
+            return False
 
     @classmethod
     def from_db_project(cls, project: dict) -> "PMSession | None":
@@ -324,6 +330,21 @@ class PMSession:
         session_store.save_state(self)
         return question
 
+    def skip_clarify(self) -> None:
+        """用户赶时间：跳过剩余追问，直接进入大纲阶段。
+
+        只推进阶段并记录一条说明，不改动已回答的内容与轮次；
+        后续 build_outline 仍使用已有需求 + 回答生成大纲。
+        """
+        if self.phase != config.PHASE_CLARIFY:
+            return
+        self.pending_question = None
+        self.phase = config.PHASE_OUTLINE
+        self.transcript.append(
+            {"role": "assistant", "content": "已按你的要求跳过剩余追问，直接进入大纲阶段。"}
+        )
+        session_store.save_state(self)
+
     # ------------------------------------------------------------------
     # 大纲阶段
     # ------------------------------------------------------------------
@@ -410,15 +431,19 @@ class PMSession:
         )
         return "\n".join(lines)
 
-    def generate_tickets(self) -> list[Path]:
+    def generate_tickets(self, progress: Callable[[str], None] | None = None) -> list[Path]:
         """第三阶段：逐模块生成 Markdown 工单并落盘（幂等 + 生成锁）。
 
-        V5.1 防重复策略：
-        - 已有主工单（排除 fix_*.md）直接拦截，提示「工单已存在」；
-        - .tasks/.generating.lock 用 O_CREAT|O_EXCL 原子创建，双击/并发只有一个能拿到；
-        - 锁超过 10 分钟视为崩溃残留，自动清理后允许重试；
-        - 无论成功失败都释放锁，并落盘当前阶段，保证 F5 后状态可恢复。
+        V3.3.1 变化：
+        - 增加 progress 回调，供 UI 用 st.status 展示「1/5、2/5」步进；
+        - 每张工单生成后先写入内存 generated_ticket_data；
+        - 数据库写入失败不拦用户，只标记 db_sync_failed，UI 用内存数据生成 ZIP。
         """
+
+        def _notify(message: str) -> None:
+            if progress:
+                progress(message)
+
         if not self.outline_confirmed or self.outline is None:
             raise LogicError("请先确认大纲，再生成工单")
 
@@ -451,9 +476,18 @@ class PMSession:
 
         paths: list[Path] = []
         name_to_file: dict[str, str] = {}
+        self.generated_ticket_data = []
+        self.db_sync_failed = False
+        total = len(self.outline.modules) + (1 if self.outline.research_needed else 0)
+        index = 0
         try:
+            _notify("正在读取你的需求描述...")
+            _notify("正在拆解功能模块...")
+
             # 3) 前置调研工单（如需要）：作为第一张工单，后续模块可依赖它
             if self.outline.research_needed:
+                index += 1
+                _notify(f"正在撰写工单 {index}/{total}...")
                 body = llm_client.chat_text(
                     prompts.TICKET_PROMPT,
                     self._ticket_request(module=None, research=True, depends_files=[]),
@@ -466,12 +500,17 @@ class PMSession:
                     body,
                     depends_on=[],
                 )
-                # 本地文件写完后立即入库；失败会回滚本地文件并抛错
-                self._persist_ticket(path, config.RESEARCH_PREFIX)
+                # 先放内存，再尝试入库；入库失败不拦用户
+                self.generated_ticket_data.append(
+                    {"filename": path.name, "type": config.RESEARCH_PREFIX, "content_md": body}
+                )
+                self._persist_ticket(path, config.RESEARCH_PREFIX, body)
                 paths.append(path)
 
             # 4) 模块工单：逐个生成，依赖映射成文件名，绝不复制其他工单全文
             for module in self.outline.modules:
+                index += 1
+                _notify(f"正在撰写工单 {index}/{total}...")
                 depends_files = [
                     name_to_file[name] for name in module.depends_on if name in name_to_file
                 ]
@@ -487,15 +526,21 @@ class PMSession:
                     body,
                     depends_on=depends_files,
                 )
-                # 模块工单同步入库，导出 ZIP 时只从数据库拉取
-                self._persist_ticket(path, module.kind)
+                self.generated_ticket_data.append(
+                    {"filename": path.name, "type": module.kind, "content_md": body}
+                )
+                self._persist_ticket(path, module.kind, body)
                 name_to_file[module.name] = path.name
                 paths.append(path)
 
             self.generated_tickets = [str(path) for path in paths]
             self.phase = config.PHASE_TICKETS
-            # 阶段写库；工单已在上面逐张入库
-            self._sync_project()
+            _notify("正在整理工单与项目状态...")
+            try:
+                self._sync_project()
+            except Exception as exc:
+                print(f"[pm] 项目状态同步失败（已标记）：{type(exc).__name__}: {str(exc)[:160]}")
+                self.db_sync_failed = True
             return paths
         finally:
             # 释放锁 + 落盘阶段；落盘失败不影响工单结果，因此单独兜底
@@ -563,7 +608,6 @@ def generate_fix_ticket(project_slug: str, log_text: str, project_id: str = "") 
             )
         except Exception as exc:
             path.unlink(missing_ok=True)
-            raise LogicError(
-                f"Fix 工单写入数据库失败：{type(exc).__name__}: {exc}"
-            ) from exc
+            print(f"[pm] Fix 工单入库失败：{type(exc).__name__}: {str(exc)[:160]}")
+            raise LogicError("Fix 工单写入数据库失败，请稍后重试") from None
     return path
