@@ -81,7 +81,7 @@ def main() -> None:
 
     try:
         import libsql
-        print("LIBSQL:", "installed", getattr(libsql, "__version__", ""))
+        print("LIBSQL:", "installed")
     except Exception as exc:
         print("LIBSQL: MISSING /", type(exc).__name__)
 

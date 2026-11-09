@@ -8,8 +8,8 @@ session_store.py —— 会话状态持久化（V5.1 状态恢复）
   作为一条 state_snapshot 追加到本地 JSONL，页面重新加载时读最后一条恢复。
 
 存放位置：
-- 追问阶段（项目名未定）：D:\projects\_drafts\session.jsonl
-- 大纲生成后（有项目目录）：D:\projects\{项目名}\.history\session.jsonl
+- 追问阶段（项目名未定）：{PROJECTS_ROOT}/_drafts/session.jsonl
+- 大纲生成后（有项目目录）：{PROJECTS_ROOT}/{项目名}/.history/session.jsonl
 
 设计原则：
 - 只追加、不覆盖，天然保留历史，便于排查；

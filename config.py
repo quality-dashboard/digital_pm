@@ -186,11 +186,10 @@ def build_system_prompt(task_prompt: str) -> str:
 # 三、项目与工单路径
 # =============================================================================
 # 代码目录与项目数据目录分离：删代码不影响工单，清理工单不动代码。
-# 默认放代码目录 data/projects：跨平台、云端可写（临时）；本地可用 PM_PROJECTS_ROOT 覆盖
-PROJECTS_ROOT: Path = Path(
-    read_setting("PM_PROJECTS_ROOT", str(PM_ROOT / "data" / "projects"))
-)
-TASKS_DIR_NAME: str = ".tasks"          # 工单目录：{PROJECTS_ROOT}\{项目名}\.tasks\
+# 默认相对路径 ./data/projects：云端容器没有 D 盘，相对路径随启动目录解析；
+# 本地可用 .env 的 PM_PROJECTS_ROOT=D:\projects 覆盖，不影响现有数据。
+PROJECTS_ROOT: Path = Path(read_setting("PM_PROJECTS_ROOT", "./data/projects"))
+TASKS_DIR_NAME: str = ".tasks"          # 工单目录：{PROJECTS_ROOT}/{项目名}/.tasks/
 HISTORY_DIR_NAME: str = ".history"      # 对话与确认留痕，排查用
 PROJECT_META_FILE: str = "project.md"   # 项目级上下文：需求 / 大纲 / 规则快照
 

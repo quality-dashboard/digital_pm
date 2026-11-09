@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-db.py —— V3.1.1 数据访问层（Turso 云端 / 本地 SQLite 自动降级）
+db.py —— V3.2.2 数据访问层（Turso 云端 / 本地 SQLite 自动降级）
 
 为什么单独一层：
 - 上层（project_store / app_ui）只关心 SQL 与结果，不关心连的是 Turso 还是本地文件；
 - Turso 与 SQLite 都使用 ? 占位符，SQL 可以完全复用；
 - 本地未配置 TURSO_DATABASE_URL 时自动用 SQLite，方便开发测试，不阻塞本地运行。
 
+客户端选择：
+- 使用 Turso 官方 libsql 包（libsql.connect(...)），走 HTTP pipeline，
+  避免 libsql-client 在部分网络/新版 Turso 上出现的 WebSocket 400 握手问题；
+- 如果 libsql 在当前网络不可用，页面会自动降级到本地 SQLite 并提示原因。
+
 安全：
-- TURSO_AUTH_TOKEN 只从环境变量读取，不打印、不写日志、不返回给前端；
+- TURSO_AUTH_TOKEN 只在连接时使用；诊断日志最多打印前 10 位；
 - 所有写入都走参数绑定，不做 SQL 字符串拼接。
 
 线程安全：
@@ -86,8 +91,8 @@ class Database:
     def _ensure_client(self) -> None:
         """惰性建立连接：没有实际读写前不连接数据库，避免页面启动即失败。
 
-        注意：这里已从废弃的 libsql-client 切换到官方新包 libsql。
-        libsql.connect(url, auth_token=...) 返回 DB-API 连接，用法与 sqlite3 基本一致。
+        重要：这里使用 Turso 官方 libsql 包，不要换回旧的 libsql-client。
+        libsql.connect 走 HTTP pipeline，避免 WebSocket 400 握手失败。
         """
         if self._conn is not None:
             return
@@ -111,16 +116,16 @@ class Database:
                 f"token={config.TURSO_AUTH_TOKEN[:10]}... "
                 f"token_len={len(config.TURSO_AUTH_TOKEN)}"
             )
-            # 官方推荐写法：libsql.connect(database, auth_token=...)
+            # 官方推荐写法：libsql.connect(database=..., auth_token=...)
             # timeout 给 15 秒，兼顾 Turso 冷启动与网络抖动
             self._conn = libsql.connect(
-                config.TURSO_DATABASE_URL,
+                database=config.TURSO_DATABASE_URL,
                 auth_token=config.TURSO_AUTH_TOKEN,
                 timeout=15.0,
             )
             return
 
-        # 本地降级：SQLite 文件放 PM_ROOT/data/local.db
+        # 本地降级：SQLite 文件放代码目录 data/local.db（跨平台绝对路径）
         config.LOCAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(config.LOCAL_DB_PATH), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -194,7 +199,8 @@ class Database:
         """返回连接状态，供 UI 排查；异常不抛出，只返回可读文本。"""
         try:
             self.query("SELECT 1 AS ok")
-            return f"ok ({self._backend})"
+            suffix = f" ｜ 已降级：{self.fallback_reason[:120]}" if self.fallback_reason else ""
+            return f"ok ({self._backend}){suffix}"
         except Exception as exc:  # 数据库不可达不应该让页面直接崩
             return f"error ({self._backend}): {type(exc).__name__}: {exc}"
 
