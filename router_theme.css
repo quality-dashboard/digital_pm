@@ -1,0 +1,392 @@
+/* ============================================================================
+   Router · 数字项目经理 · 界面主题样式表 v1.0
+   配套：《数字项目经理_界面视觉重构规范 v1.0》
+
+   注入方式：st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+   匹配锚点优先级： .st-key-* （若版本支持） > [data-testid="..."] > .block-container
+   ⚠️ 禁止使用 .css-1a2b3c 这类哈希类名：Streamlit 每次构建都会变
+
+   原则：所有可调参数集中在 :root，调视觉只改变量，不改选择器
+   ============================================================================ */
+
+:root {
+  /* —— 品牌与强调 —— */
+  --pm-ink:        #16233B;  /* 暗夜蓝：主按钮、标题、步骤完成 */
+  --pm-ink-hover:  #24365B;
+  --pm-accent:     #3B6FD9;  /* 步骤当前、链接、focus 光圈 */
+  --pm-accent-soft:#E8EEFB;
+
+  /* —— 中性灰阶（全部带蓝调，禁用纯灰 #F5F5F5 / 纯黑 #000）—— */
+  --pm-bg:         #F5F7FA;
+  --pm-surface:    #FFFFFF;
+  --pm-surface-2:  #FAFBFD;
+  --pm-line:       #E5EAF1;
+  --pm-line-soft:  #EFF2F7;
+  --pm-text:       #1E293B;
+  --pm-text-2:     #64748B;
+  --pm-text-3:     #94A3B8;
+
+  /* —— 低饱和状态色（马卡龙降饱和，底 / 字成对）—— */
+  --pm-run-bg:     #E8EEFB;  --pm-run-fg:     #2C5AA0;  /* 追问中 / 进行中 */
+  --pm-wait-bg:    #FBF0DF;  --pm-wait-fg:    #9A6612;  /* 等待确认 */
+  --pm-done-bg:    #E6F3EC;  --pm-done-fg:    #2F7A58;  /* 已完成 */
+  --pm-error-bg:   #FAEAEA;  --pm-error-fg:   #A84444;  /* 报错 / 阻塞 */
+  --pm-neutral-bg: #EEF1F5;  --pm-neutral-fg: #5B677D;  /* 中性 */
+
+  /* —— 间距标尺：4 / 8 / 12 / 16 / 24 / 32 —— */
+  --pm-s1: 4px;  --pm-s2: 8px;  --pm-s3: 12px;
+  --pm-s4: 16px; --pm-s6: 24px; --pm-s8: 32px;
+
+  --pm-radius:    12px;
+  --pm-radius-sm: 8px;
+  --pm-shadow:    0 1px 2px rgba(22,35,59,.05), 0 4px 14px rgba(22,35,59,.05);
+  --pm-transition: .22s ease-out;
+}
+
+/* ---------------------------------------------------------------------------
+   1. 全局底板
+   --------------------------------------------------------------------------- */
+html, body, [data-testid="stAppViewContainer"], .main {
+  background: var(--pm-bg) !important;
+  color: var(--pm-text);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+               "Microsoft YaHei", "Noto Sans SC", "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 主工作区留白：信息密度高，但四周要透气 */
+.main .block-container {
+  padding-top: 24px !important;
+  padding-bottom: 48px !important;
+  max-width: 1440px;
+}
+
+/* Streamlit 原生顶栏：只保留功能，不做视觉存在 */
+[data-testid="stHeader"] {
+  background: transparent !important;
+  border-bottom: none !important;
+  height: 0 !important;
+}
+
+/* 淡色分割线：覆盖 st.divider 的默认重线 */
+hr, [data-testid="stDivider"] hr {
+  border: none !important;
+  border-top: 1px solid var(--pm-line) !important;
+  margin: var(--pm-s6) 0 !important;
+}
+
+/* 滚动条：细、淡、不抢戏 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #D8DEE8; border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: #C2CAD8; }
+
+/* ---------------------------------------------------------------------------
+   2. 自定义顶部 Header（ui_theme.render_header 输出）
+   --------------------------------------------------------------------------- */
+.pm-header {
+  display: flex; align-items: center; gap: var(--pm-s6);
+  padding: var(--pm-s3) var(--pm-s4);
+  margin-bottom: var(--pm-s6);
+  background: var(--pm-surface);
+  border: 1px solid var(--pm-line);
+  border-radius: var(--pm-radius);
+  box-shadow: var(--pm-shadow);
+}
+.pm-brand { display: flex; align-items: baseline; gap: var(--pm-s2); white-space: nowrap; }
+.pm-brand-name { font-size: 15px; font-weight: 700; letter-spacing: .2px; color: var(--pm-ink); }
+.pm-brand-sub  { font-size: 11px; font-weight: 600; letter-spacing: 1.5px;
+                 text-transform: uppercase; color: var(--pm-text-3); }
+.pm-header-right { margin-left: auto; display: flex; align-items: center; gap: var(--pm-s3); }
+.pm-header-project { font-size: 12px; color: var(--pm-text-2); }
+
+/* 三步进度：同色相深浅递进，表达「在哪一步」而非「是什么类别」 */
+.pm-steps { display: flex; align-items: center; gap: var(--pm-s2); }
+.pm-step { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--pm-text-3); }
+.pm-step-dot { width: 20px; height: 20px; border-radius: 50%;
+               display: inline-flex; align-items: center; justify-content: center;
+               font-size: 11px; font-weight: 700;
+               border: 1.5px solid #D8DEE8; background: var(--pm-surface); color: var(--pm-text-3); }
+.pm-step.is-done .pm-step-dot { background: var(--pm-ink); border-color: var(--pm-ink); color: #FFF; }
+.pm-step.is-done { color: var(--pm-text); font-weight: 500; }
+.pm-step.is-active .pm-step-dot { background: var(--pm-surface); border: 2px solid var(--pm-accent); color: var(--pm-accent); }
+.pm-step.is-active { color: var(--pm-ink); font-weight: 600; }
+.pm-step-line { width: 24px; height: 1px; background: var(--pm-line); }
+
+/* ---------------------------------------------------------------------------
+   3. 状态徽章（柔和低饱和圆角标签）
+   --------------------------------------------------------------------------- */
+.pm-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 24px; padding: 0 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; letter-spacing: .2px;
+  white-space: nowrap; line-height: 1;
+}
+.pm-badge--run     { background: var(--pm-run-bg);     color: var(--pm-run-fg); }
+.pm-badge--wait    { background: var(--pm-wait-bg);    color: var(--pm-wait-fg); }
+.pm-badge--done    { background: var(--pm-done-bg);    color: var(--pm-done-fg); }
+.pm-badge--error   { background: var(--pm-error-bg);   color: var(--pm-error-fg); }
+.pm-badge--neutral { background: var(--pm-neutral-bg); color: var(--pm-neutral-fg); }
+.pm-badge-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .75; }
+
+/* ---------------------------------------------------------------------------
+   4. 侧边栏 → 状态面板
+   --------------------------------------------------------------------------- */
+[data-testid="stSidebar"] {
+  background: var(--pm-surface) !important;
+  border-right: 1px solid var(--pm-line) !important;
+}
+[data-testid="stSidebar"] .block-container { padding-top: 20px !important; }
+[data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
+  font-size: 13px !important; font-weight: 700 !important;
+  color: var(--pm-text-2) !important; letter-spacing: .5px;
+}
+.pm-panel-card {
+  background: var(--pm-surface-2);
+  border: 1px solid var(--pm-line);
+  border-radius: var(--pm-radius);
+  padding: var(--pm-s4);
+  margin-bottom: var(--pm-s4);
+}
+.pm-panel-title { font-size: 11px; font-weight: 700; letter-spacing: 1.2px;
+                  text-transform: uppercase; color: var(--pm-text-3); margin-bottom: var(--pm-s3); }
+.pm-panel-row { display: flex; justify-content: space-between; align-items: baseline;
+                font-size: 12px; color: var(--pm-text-2); padding: 5px 0;
+                border-bottom: 1px solid var(--pm-line-soft); }
+.pm-panel-row:last-child { border-bottom: none; }
+.pm-panel-row b { color: var(--pm-text); font-weight: 600;
+                  font-variant-numeric: tabular-nums; }
+.pm-progress-track { height: 4px; background: var(--pm-line); border-radius: 4px; margin-top: var(--pm-s3); }
+.pm-progress-fill  { height: 4px; background: var(--pm-accent); border-radius: 4px;
+                     transition: width var(--pm-transition); }
+
+/* ---------------------------------------------------------------------------
+   5. 标签页 → 步骤导航皮肤（保留现有 st.tabs 结构，不推翻）
+   --------------------------------------------------------------------------- */
+[data-testid="stTabs"] { border-bottom: 1px solid var(--pm-line) !important; gap: var(--pm-s2); }
+[data-testid="stTabs"] button[role="tab"] {
+  font-size: 13px !important; font-weight: 500 !important;
+  color: var(--pm-text-2) !important;
+  padding: 10px 14px !important;
+  border-bottom: 2px solid transparent !important;
+  transition: color var(--pm-transition), border-color var(--pm-transition);
+}
+[data-testid="stTabs"] button[role="tab"]:hover { color: var(--pm-ink) !important; }
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+  color: var(--pm-ink) !important; font-weight: 700 !important;
+  border-bottom-color: var(--pm-accent) !important;
+}
+[data-testid="stTabs"] button[role="tab"]:focus-visible {
+  outline: none; box-shadow: 0 0 0 3px rgba(59,111,217,.14);
+}
+
+/* ---------------------------------------------------------------------------
+   6. 输入框：大、显眼、聚焦动画
+   --------------------------------------------------------------------------- */
+/* 需求描述 textarea */
+[data-testid="stTextArea"] textarea,
+[data-testid="stTextInput"] input {
+  background: var(--pm-surface) !important;
+  border: 1px solid #D8DEE8 !important;
+  border-radius: var(--pm-radius) !important;
+  color: var(--pm-text) !important;
+  font-size: 14px !important; line-height: 1.7 !important;
+  padding: 12px 14px !important;
+  box-shadow: none !important;
+  transition: border-color var(--pm-transition), box-shadow var(--pm-transition),
+              transform var(--pm-transition);
+}
+[data-testid="stTextArea"] textarea { min-height: 168px !important; }
+[data-testid="stTextArea"] textarea::placeholder,
+[data-testid="stTextInput"] input::placeholder { color: var(--pm-text-3) !important; }
+[data-testid="stTextArea"] textarea:focus,
+[data-testid="stTextInput"] input:focus {
+  border-color: var(--pm-accent) !important;
+  box-shadow: 0 0 0 4px rgba(59,111,217,.12) !important;
+  transform: translateY(-1px);
+}
+
+/* 对话输入框：新版可用 st.chat_input(height=76)，此处为 1.37 的 CSS 兜底 */
+[data-testid="stChatInput"] textarea {
+  min-height: 68px !important;
+  background: var(--pm-surface) !important;
+  border: 1px solid #D8DEE8 !important;
+  border-radius: 16px !important;
+  font-size: 14px !important; line-height: 1.6 !important;
+  padding: 14px 16px !important;
+  box-shadow: var(--pm-shadow) !important;
+  transition: border-color var(--pm-transition), box-shadow var(--pm-transition);
+}
+[data-testid="stChatInput"] textarea:focus {
+  border-color: var(--pm-accent) !important;
+  box-shadow: 0 0 0 4px rgba(59,111,217,.14), 0 8px 24px rgba(22,35,59,.08) !important;
+}
+
+/* 输入类标签：弱化，把注意力让给输入区本身 */
+[data-testid="stTextArea"] label, [data-testid="stTextInput"] label,
+[data-testid="stSelectbox"] label {
+  font-size: 12px !important; font-weight: 600 !important;
+  color: var(--pm-text-2) !important;
+}
+
+/* ---------------------------------------------------------------------------
+   7. 按钮：深色、圆角、不要方方正正
+   --------------------------------------------------------------------------- */
+[data-testid="stButton"] > button {
+  background: var(--pm-ink) !important;
+  color: #FFFFFF !important;
+  border: 1px solid var(--pm-ink) !important;
+  border-radius: 10px !important;
+  min-height: 40px !important;
+  padding: 0 20px !important;
+  font-size: 13px !important; font-weight: 600 !important;
+  box-shadow: 0 1px 2px rgba(22,35,59,.12);
+  transition: background var(--pm-transition), transform var(--pm-transition),
+              box-shadow var(--pm-transition);
+}
+[data-testid="stButton"] > button:hover {
+  background: var(--pm-ink-hover) !important;
+  border-color: var(--pm-ink-hover) !important;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(22,35,59,.18);
+}
+[data-testid="stButton"] > button:active { transform: translateY(0); }
+[data-testid="stButton"] > button:focus-visible {
+  outline: none !important;
+  box-shadow: 0 0 0 4px rgba(59,111,217,.18) !important;
+}
+[data-testid="stButton"] > button:disabled {
+  background: #E6EAF1 !important; border-color: #E6EAF1 !important;
+  color: var(--pm-text-3) !important; box-shadow: none !important; transform: none;
+}
+/* 次级按钮（非 primary）：白底描边 */
+[data-testid="stButton"] > button[kind="secondary"] {
+  background: var(--pm-surface) !important;
+  color: var(--pm-text) !important;
+  border-color: var(--pm-line) !important;
+}
+
+/* ---------------------------------------------------------------------------
+   8. 对话流：统一左对齐消息条（协同工具，不做微信式左右气泡）
+   --------------------------------------------------------------------------- */
+[data-testid="stChatMessage"] {
+  background: var(--pm-surface) !important;
+  border: 1px solid var(--pm-line) !important;
+  border-left: 2px solid var(--pm-text-3) !important;   /* 默认＝用户：灰条 */
+  border-radius: var(--pm-radius-sm) !important;
+  padding: 10px 14px !important;
+  margin-bottom: var(--pm-s2) !important;
+  box-shadow: none !important;
+}
+/* AI 消息：蓝条。若你的版本没有该 testid，用 DevTools 核验后替换（见规范 §4.3） */
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
+  border-left-color: var(--pm-accent) !important;
+  background: var(--pm-surface-2) !important;
+}
+[data-testid="stChatMessage"] p { font-size: 14px; line-height: 1.7; margin: 0; }
+
+/* 追问卡片：替代 st.info 的默认蓝底 */
+.pm-question {
+  background: var(--pm-accent-soft);
+  border: 1px solid #D6E2FA;
+  border-left: 3px solid var(--pm-accent);
+  border-radius: var(--pm-radius);
+  padding: var(--pm-s4);
+  margin: var(--pm-s4) 0;
+}
+.pm-question-label { font-size: 11px; font-weight: 700; letter-spacing: 1px;
+                     color: var(--pm-run-fg); text-transform: uppercase; margin-bottom: 6px; }
+.pm-question-text  { font-size: 15px; font-weight: 600; color: var(--pm-ink); line-height: 1.6; }
+.pm-question-why   { font-size: 12px; color: var(--pm-text-2); margin-top: var(--pm-s2); }
+
+/* ---------------------------------------------------------------------------
+   9. 卡片：大纲模块 / 工单
+   --------------------------------------------------------------------------- */
+.pm-card {
+  background: var(--pm-surface);
+  border: 1px solid var(--pm-line);
+  border-radius: var(--pm-radius);
+  padding: var(--pm-s4);
+  box-shadow: var(--pm-shadow);
+  transition: border-color var(--pm-transition), transform var(--pm-transition);
+}
+.pm-card:hover { border-color: #CBD5E4; transform: translateY(-1px); }
+.pm-card-head { display: flex; align-items: center; gap: var(--pm-s2); margin-bottom: var(--pm-s3); }
+.pm-card-index { width: 22px; height: 22px; border-radius: 6px;
+                 background: var(--pm-ink); color: #FFF;
+                 display: inline-flex; align-items: center; justify-content: center;
+                 font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.pm-card-title { font-size: 14px; font-weight: 600; color: var(--pm-text); }
+.pm-card-meta { font-size: 11.5px; color: var(--pm-text-2); line-height: 1.7; }
+.pm-card-row { display: flex; gap: 6px; font-size: 12px; color: var(--pm-text-2); margin-top: 6px; }
+.pm-card-row b { color: var(--pm-text); font-weight: 600; min-width: 42px; }
+.pm-card-file { font-size: 11px; color: var(--pm-text-3);
+                font-family: "JetBrains Mono", "SF Mono", Consolas, monospace; }
+
+/* 代码块 / 行内代码 */
+code, pre, [data-testid="stCode"] {
+  font-family: "JetBrains Mono", "SF Mono", Consolas, "Liberation Mono", monospace !important;
+  font-size: 12.5px !important;
+  font-variant-numeric: tabular-nums;
+}
+pre { border-radius: var(--pm-radius-sm) !important; border: 1px solid var(--pm-line) !important;
+      background: var(--pm-surface-2) !important; line-height: 1.6 !important; }
+:not(pre) > code { background: #F0F3F8 !important; color: #2C3E5C !important;
+                   border-radius: 4px; padding: 1px 5px; }
+
+/* ---------------------------------------------------------------------------
+   10. 原生组件收编：alert / expander / table / dataframe
+   --------------------------------------------------------------------------- */
+[data-testid="stAlert"] {
+  border-radius: var(--pm-radius-sm) !important;
+  border: 1px solid var(--pm-line) !important;
+  background: var(--pm-surface) !important;
+  color: var(--pm-text) !important;
+  font-size: 13px !important;
+}
+[data-testid="stAlert"] p { font-size: 13px !important; }
+
+details, [data-testid="stExpander"] {
+  border: 1px solid var(--pm-line) !important;
+  border-radius: var(--pm-radius-sm) !important;
+  background: var(--pm-surface) !important;
+  margin-bottom: var(--pm-s2) !important;
+}
+details > summary, [data-testid="stExpander"] summary {
+  font-size: 13px !important; font-weight: 600 !important;
+  color: var(--pm-text) !important;
+  padding: 10px 12px !important;
+}
+
+[data-testid="stTable"], [data-testid="stDataFrame"] {
+  border: 1px solid var(--pm-line) !important;
+  border-radius: var(--pm-radius-sm) !important;
+  overflow: hidden;
+}
+[data-testid="stTable"] table { font-size: 13px !important; }
+[data-testid="stTable"] th { background: var(--pm-surface-2) !important;
+                             color: var(--pm-text-2) !important; font-weight: 600 !important; }
+
+/* ---------------------------------------------------------------------------
+   11. 弱化 Streamlit 的「测试面板感」细节
+   --------------------------------------------------------------------------- */
+[data-testid="stCaptionContainer"], .stCaption, small { color: var(--pm-text-2) !important; }
+[data-testid="stSpinner"] > div { border-top-color: var(--pm-accent) !important; }
+[data-testid="stMarkdownContainer"] h1 { font-size: 22px !important; font-weight: 600 !important;
+                                          color: var(--pm-ink) !important; }
+[data-testid="stMarkdownContainer"] h2,
+[data-testid="stMarkdownContainer"] h3 { font-size: 15px !important; font-weight: 600 !important;
+                                          color: var(--pm-ink) !important; }
+
+/* ---------------------------------------------------------------------------
+   12. 动效偏好与窄屏
+   --------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; }
+}
+@media (max-width: 1100px) {
+  .pm-header { flex-wrap: wrap; gap: var(--pm-s3); }
+  .pm-header-right { margin-left: 0; width: 100%; }
+}

@@ -1,0 +1,12 @@
+# 放置路径：D:\digital_pm\.streamlit\config.toml （项目里目前没有这个目录，需新建）
+# 作用：一次性消除 Streamlit 默认的刺眼红 #FF4B4B 与亮绿 success，
+#       并把主色/底色/文字色交给官方主题引擎，CSS 只做精细打磨。
+# 改完后重启 Streamlit 进程生效（主题不随脚本 rerun 重载）。
+
+[theme]
+base = "light"
+primaryColor = "#16233B"
+backgroundColor = "#F5F7FA"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1E293B"
+font = "sans serif"
