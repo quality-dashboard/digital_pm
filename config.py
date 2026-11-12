@@ -248,10 +248,15 @@ DASHSCOPE_API_KEY_ENV: str = "DASHSCOPE_API_KEY"
 DASHSCOPE_BASE_URL: str = read_setting(
     "DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
 ).rstrip("/")
-# V3.3.4 欠费保护：只用最基础的经典模型，避免变种/第三方模型产生额外费用。
-# 注意：账号欠费或免费额度耗尽时会直接提示「系统今日额度已用尽」，不再自动切换模型。
-LLM_MODELS: tuple[str, ...] = ("qwen-turbo", "qwen-plus")
-DASHSCOPE_MODEL: str = read_setting("DASHSCOPE_MODEL", "qwen-turbo")
+# V3.3.5：切换到账号下有额度的三个文本模型（按推荐顺序）。
+# qwen3.8-flash 放首位：百炼自家模型，OpenAI 兼容协议最稳；
+# glm-5.3 / deepseek-v4.1-flash 作为 fallback，失败自动切换。
+LLM_MODELS: tuple[str, ...] = (
+    "qwen3.8-flash",
+    "glm-5.3",
+    "deepseek-v4.1-flash",
+)
+DASHSCOPE_MODEL: str = read_setting("DASHSCOPE_MODEL", "qwen3.8-flash")
 # 单次请求最大输出 token：严格封顶，防止模型输出过长导致费用失控
 LLM_MAX_OUTPUT_TOKENS: int = 2000
 
