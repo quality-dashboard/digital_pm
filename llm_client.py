@@ -25,7 +25,23 @@ import config
 
 # 模型池：Plus 性价比最高；失败后切 Turbo；最后 Max 兜底。
 # 如果环境变量 DASHSCOPE_MODEL 显式配置了其他模型，会放在池子最前面。
-MODELS: tuple[str, ...] = ("qwen-plus", "qwen-turbo", "qwen-max")
+# 2026-11-12 实测可用模型（按业务优先级排序）：
+# 已剔除额度过期的 qwen-plus / qwen-turbo / qwen-max 等旧模型，
+# 避免每次请求都先撞一次失败再切换。
+MODELS: tuple[str, ...] = (
+    "qwen3.7-plus",
+    "qwen-plus-2025-11-05",
+    "qwen3.8-27b",
+    "qwen3.8-flash",
+    "deepseek-v4.1-flash",
+    "glm-5.3-prime",
+    "glm-5.3",
+    "kimi-k3.1-pro",
+    "glm-5.2-fast-preview",
+    "deepseek-v4.1-flash-1017",
+    "deepseek-r1-distill-qwen-1.5b",
+    "qwen-deep-search-planning",
+)
 
 # 页面统一展示的友好提示：不包含 HTTP 状态码、路径、堆栈
 FRIENDLY_ERROR = "AI 服务当前繁忙，请稍后重试"
@@ -50,11 +66,20 @@ def is_configured() -> bool:
 
 
 def _model_pool() -> list[str]:
-    """模型池：用户显式配置的模型优先，其余按 MODELS 顺序补位，去重。"""
+    """模型池：仅在用户配置的模型属于可用池时优先，否则按 MODELS 顺序。
+
+    这样即使 .env / Secrets 里还留着已过期的 qwen-plus，也不会每次先撞一次
+    失败再切换，直接使用探测出的可用模型。
+    """
     configured = (config.DASHSCOPE_MODEL or "").strip()
-    ordered: list[str] = [configured] if configured else []
+    ordered: list[str] = [configured] if configured and configured in MODELS else []
     ordered.extend(model for model in MODELS if model not in ordered)
     return ordered
+
+
+def primary_model() -> str:
+    """返回当前实际优先使用的模型，供 UI 展示。"""
+    return _model_pool()[0]
 
 
 def _post(system_prompt: str, user_content: str, json_mode: bool, model: str) -> str:

@@ -374,7 +374,7 @@ with st.sidebar:
         round_now=_sidebar_session.round if _sidebar_session else 0,
         round_max=config.MAX_CLARIFY_ROUNDS,
         meta_rows=[
-            ("模型", config.DASHSCOPE_MODEL),
+            ("模型", llm_client.primary_model()),
             ("存储", db.db.backend),
             ("连接", db.db.healthcheck()),
             ("API Key", "已配置" if llm_client.is_configured() else "未配置"),

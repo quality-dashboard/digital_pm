@@ -248,7 +248,9 @@ DASHSCOPE_API_KEY_ENV: str = "DASHSCOPE_API_KEY"
 DASHSCOPE_BASE_URL: str = read_setting(
     "DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
 ).rstrip("/")
-DASHSCOPE_MODEL: str = read_setting("DASHSCOPE_MODEL", "qwen-plus")
+# 默认使用当前账号实测可用的 plus 系列；旧 qwen-plus 额度已过期，
+# 即使 .env / Secrets 里还留着它，llm_client 的模型池也会忽略并走可用列表。
+DASHSCOPE_MODEL: str = read_setting("DASHSCOPE_MODEL", "qwen3.7-plus")
 
 
 def _env_number(name: str, default: str, cast):
