@@ -25,23 +25,9 @@ import config
 
 # 模型池：Plus 性价比最高；失败后切 Turbo；最后 Max 兜底。
 # 如果环境变量 DASHSCOPE_MODEL 显式配置了其他模型，会放在池子最前面。
-# 2026-11-12 实测可用模型（按业务优先级排序）：
-# 已剔除额度过期的 qwen-plus / qwen-turbo / qwen-max 等旧模型，
-# 避免每次请求都先撞一次失败再切换。
-MODELS: tuple[str, ...] = (
-    "qwen3.7-plus",
-    "qwen-plus-2025-11-05",
-    "qwen3.8-27b",
-    "qwen3.8-flash",
-    "deepseek-v4.1-flash",
-    "glm-5.3-prime",
-    "glm-5.3",
-    "kimi-k3.1-pro",
-    "glm-5.2-fast-preview",
-    "deepseek-v4.1-flash-1017",
-    "deepseek-r1-distill-qwen-1.5b",
-    "qwen-deep-search-planning",
-)
+# 欠费保护：模型池统一由 config.LLM_MODELS 管理，只保留最基础的经典模型。
+# 不再包含 qwen3.8/glm/kimi 等变种或第三方模型，避免产生额外费用。
+MODELS: tuple[str, ...] = config.LLM_MODELS
 
 # 页面统一展示的友好提示：不包含 HTTP 状态码、路径、堆栈
 FRIENDLY_ERROR = "AI 服务当前繁忙，请稍后重试"
@@ -53,6 +39,10 @@ class LLMError(RuntimeError):
 
 class MissingAPIKeyError(LLMError):
     """未配置 DASHSCOPE_API_KEY 时抛出。"""
+
+
+class QuotaExceededError(LLMError):
+    """402/403：欠费或额度耗尽，必须立即停止请求，避免继续产生费用。"""
 
 
 def get_api_key() -> str:
@@ -97,6 +87,8 @@ def _post(system_prompt: str, user_content: str, json_mode: bool, model: str) ->
             {"role": "user", "content": user_content},
         ],
         "temperature": config.LLM_TEMPERATURE,
+        # 严格封顶输出 token，防止模型输出过长导致费用失控
+        "max_tokens": config.LLM_MAX_OUTPUT_TOKENS,
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
@@ -119,6 +111,10 @@ def _post(system_prompt: str, user_content: str, json_mode: bool, model: str) ->
         print(f"[llm] {model} 网络异常：{type(exc).__name__}: {str(exc)[:160]}")
         raise LLMError("连接 AI 服务失败") from None
 
+    if response.status_code in (402, 403):
+        print(f"[llm] {model} 返回 HTTP {response.status_code}，疑似欠费/额度耗尽，停止请求")
+        raise QuotaExceededError("系统今日额度已用尽")
+
     if response.status_code >= 400:
         print(f"[llm] {model} HTTP {response.status_code}：{response.text[:200]}")
         raise LLMError("AI 服务返回错误")
@@ -140,6 +136,9 @@ def _call(system_prompt: str, user_content: str, json_mode: bool) -> str:
     for model in _model_pool():
         try:
             return _post(system_prompt, user_content, json_mode, model)
+        except QuotaExceededError:
+            # 欠费/额度耗尽：立即停止，不再尝试其他模型，避免继续请求
+            raise
         except LLMError as exc:
             last_error = exc
             print(f"[llm] {model} 失败，切换下一个模型：{str(exc)[:120]}")
