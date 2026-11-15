@@ -271,7 +271,8 @@ def _env_number(name: str, default: str, cast):
         return cast(default)
 
 
-LLM_TIMEOUT = _env_number("LLM_TIMEOUT", "90", float)                 # 单次请求读超时（秒）
+# 用户要求：读超时统一 60 秒，避免长文本生成被过早切断
+LLM_TIMEOUT = _env_number("LLM_TIMEOUT", "60", float)
 # 建连超时单独收紧：网络不通时 10 秒内失败并切换模型，避免页面长期无响应
 LLM_CONNECT_TIMEOUT = _env_number("LLM_CONNECT_TIMEOUT", "10", float)
 LLM_MAX_ATTEMPTS = max(1, int(_env_number("LLM_MAX_ATTEMPTS", "2", int)))  # 含首次在内的总尝试次数

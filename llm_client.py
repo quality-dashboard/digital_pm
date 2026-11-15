@@ -99,11 +99,17 @@ def _post(system_prompt: str, user_content: str, json_mode: bool, model: str) ->
     except ImportError:
         raise LLMError("AI 服务组件缺失，请联系管理员") from None
 
+    system_text = config.build_system_prompt(system_prompt)
+    # 排查用：打印实际请求长度，判断是否接近模型 Token 上限
+    print(
+        f"[llm] {model} 请求长度：system={len(system_text)} 字符 / "
+        f"user={len(user_content)} 字符 / max_tokens={config.LLM_MAX_OUTPUT_TOKENS}"
+    )
     payload: dict = {
         "model": model,
         "messages": [
             # 规则注入在这里发生：每次请求都强制带上协作偏好与技术红线
-            {"role": "system", "content": config.build_system_prompt(system_prompt)},
+            {"role": "system", "content": system_text},
             {"role": "user", "content": user_content},
         ],
         "temperature": config.LLM_TEMPERATURE,
@@ -137,6 +143,19 @@ def _post(system_prompt: str, user_content: str, json_mode: bool, model: str) ->
         # 内部细节只写服务端日志，不进入页面
         print(f"[llm] {model} 网络异常：{type(exc).__name__}: {str(exc)[:160]}")
         raise LLMError("连接 AI 服务失败") from None
+
+    if response.status_code == 429:
+        print(f"[llm] {model} 触发 429 限流，等待 2 秒后重试一次")
+        time.sleep(2)
+        try:
+            timeout = httpx.Timeout(
+                config.LLM_TIMEOUT, connect=config.LLM_CONNECT_TIMEOUT
+            )
+            with httpx.Client(timeout=timeout) as client:
+                response = client.post(url, headers=headers, json=payload)
+        except Exception as exc:
+            print(f"[llm] {model} 429 重试网络异常：{type(exc).__name__}: {str(exc)[:160]}")
+            raise LLMError("连接 AI 服务失败") from None
 
     if response.status_code in (402, 403):
         print(f"[llm] {model} 返回 HTTP {response.status_code}，疑似欠费/额度耗尽，停止请求")
@@ -244,6 +263,7 @@ def chat_text(
     """要求模型返回 Markdown 正文（工单 / Fix 工单使用）。"""
     text = _call(system_prompt, user_content, json_mode=False, progress=progress).strip()
     if not text:
+        print("[llm] 模型返回内容为空（已拦截，不写工单）")
         raise LLMError("AI 返回内容为空，请重试")
     if len(text) > config.MAX_TICKET_CHARS:
         # 截断只是兜底保护；正常工单应远小于上限

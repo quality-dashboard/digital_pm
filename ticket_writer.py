@@ -127,6 +127,11 @@ def write_ticket(
     标题与元信息由代码生成，模型只负责从「## 0」开始的正文，
     这样即使模型输出漂移，工单格式也保持稳定、可扫描、可验收。
     """
+    body = (body_markdown or "").strip()
+    # 硬拦截：模型返回空内容/极短内容时绝不写文件，避免生成可下载的空工单
+    if len(body) < 50:
+        raise ValueError("大模型返回内容为空，终止写入")
+
     paths = config.ensure_project_dirs(project_slug)
     tasks_dir = paths["tasks_dir"]
     number = _next_number(tasks_dir, r"^(\d+)_")
@@ -142,7 +147,7 @@ def write_ticket(
             "",
         ]
     )
-    content = header + body_markdown.strip() + "\n"
+    content = header + body + "\n"
 
     filename = f"{number:0{config.TICKET_NUMBER_WIDTH}d}_{kind}_{_slug(title)}.md"
     target = tasks_dir / filename
@@ -161,11 +166,15 @@ def write_ticket(
 
 def write_fix_ticket(project_slug: str, body_markdown: str) -> Path:
     """写入 fix_NN.md；标题从正文第一行 `# ...` 提取，缺失则补默认标题。"""
+    body = (body_markdown or "").strip()
+    # 与主工单同样的硬拦截：不写空 Fix 工单
+    if len(body) < 50:
+        raise ValueError("大模型返回内容为空，终止写入")
+
     paths = config.ensure_project_dirs(project_slug)
     tasks_dir = paths["tasks_dir"]
     number = _next_number(tasks_dir, r"^fix_(\d+)\.md$")
 
-    body = body_markdown.strip()
     if not body.startswith("#"):
         body = f"# [Fix] 待修复问题 {number:02d}\n\n{body}"
 

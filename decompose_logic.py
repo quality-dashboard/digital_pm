@@ -500,19 +500,28 @@ class PMSession:
             if self.outline.research_needed:
                 index += 1
                 _notify(f"正在撰写工单 {index}/{total}...")
+                print(f"--- 正在请求大模型生成第 {index}/{total} 个工单（research）---")
                 body = llm_client.chat_text(
                     prompts.TICKET_PROMPT,
                     self._ticket_request(module=None, research=True, depends_files=[]),
                     progress=_notify,
                 )
-                path = ticket_writer.write_ticket(
-                    self.project_slug,
-                    self.outline.project_name,
-                    config.RESEARCH_PREFIX,
-                    f"前置调研：{self.outline.research_goal or '需求调研'}",
-                    body,
-                    depends_on=[],
-                )
+                print(f"--- 成功拿到内容，长度 {len(body)}，准备写文件 ---")
+                try:
+                    path = ticket_writer.write_ticket(
+                        self.project_slug,
+                        self.outline.project_name,
+                        config.RESEARCH_PREFIX,
+                        f"前置调研：{self.outline.research_goal or '需求调研'}",
+                        body,
+                        depends_on=[],
+                    )
+                except ValueError as exc:
+                    print(f"--- 工单写入被拦截：{exc} ---")
+                    raise LogicError(
+                        f"AI 返回内容为空，已终止写入（第 {index} 张），请重试"
+                    ) from None
+                print(f"--- 已写入 {path.name} ---")
                 # 先放内存，再尝试入库；入库失败不拦用户
                 self.generated_ticket_data.append(
                     {"filename": path.name, "type": config.RESEARCH_PREFIX, "content_md": body}
@@ -524,6 +533,10 @@ class PMSession:
             for module in self.outline.modules:
                 index += 1
                 _notify(f"正在撰写工单 {index}/{total}...")
+                print(
+                    f"--- 正在请求大模型生成第 {index}/{total} 个工单"
+                    f"（{module.name} / {module.kind}）---"
+                )
                 depends_files = [
                     name_to_file[name] for name in module.depends_on if name in name_to_file
                 ]
@@ -532,14 +545,22 @@ class PMSession:
                     self._ticket_request(module=module, research=False, depends_files=depends_files),
                     progress=_notify,
                 )
-                path = ticket_writer.write_ticket(
-                    self.project_slug,
-                    self.outline.project_name,
-                    module.kind,
-                    module.name,
-                    body,
-                    depends_on=depends_files,
-                )
+                print(f"--- 成功拿到内容，长度 {len(body)}，准备写文件 ---")
+                try:
+                    path = ticket_writer.write_ticket(
+                        self.project_slug,
+                        self.outline.project_name,
+                        module.kind,
+                        module.name,
+                        body,
+                        depends_on=depends_files,
+                    )
+                except ValueError as exc:
+                    print(f"--- 工单写入被拦截：{exc} ---")
+                    raise LogicError(
+                        f"AI 返回内容为空，已终止写入（第 {index} 张），请重试"
+                    ) from None
+                print(f"--- 已写入 {path.name} ---")
                 self.generated_ticket_data.append(
                     {"filename": path.name, "type": module.kind, "content_md": body}
                 )
