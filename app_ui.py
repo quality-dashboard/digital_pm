@@ -349,10 +349,10 @@ def _handle_chat_message(session: decompose_logic.PMSession | None, text: str) -
         st.rerun()
 
 
-# 首次加载：按 session_id 从数据库恢复最近项目（项目级状态，不含对话）
+# 首次加载：恢复最近项目（不按 session_id 过滤，刷新/换浏览器后不丢失历史任务）
 if "pm_session" not in st.session_state:
     try:
-        _recent_projects = project_store.repo.list_projects(session_id, limit=1)
+        _recent_projects = project_store.repo.list_projects(limit=1)
     except Exception:
         st.error("数据库连接失败，请联系管理员或稍后重试。")
         st.stop()
@@ -395,24 +395,27 @@ with st.sidebar:
     st.divider()
     st.subheader("项目")
     try:
-        _projects = project_store.repo.list_projects(session_id, limit=50)
+        # 全局项目列表：访问码是唯一门禁，不再按浏览器会话隔离，
+        # 否则关闭标签页 / 换浏览器后旧任务会“消失”。
+        _projects = project_store.repo.list_projects(limit=50)
     except Exception:
         st.error("读取项目列表失败，请稍后重试。")
         st.stop()
 
-    _options = ["（新建项目）"] + [item["id"] for item in _projects]
-    _labels = {"（新建项目）": "（新建项目）"}
-    _labels.update(
-        {
-            item["id"]: f"{item['name']}（{_PHASE_LABELS.get(item['phase'], item['phase'])}）"
-            for item in _projects
-        }
-    )
+    # 最近项目放最前并默认选中，“（新建项目）”放最后
+    _options = [item["id"] for item in _projects] + ["（新建项目）"]
+    _labels = {
+        item["id"]: f"{item['name']}（{_PHASE_LABELS.get(item['phase'], item['phase'])}）"
+        for item in _projects
+    }
+    _labels["（新建项目）"] = "（新建项目）"
     selected_project_id = st.selectbox(
         "当前项目",
         _options,
+        index=0,
         format_func=lambda pid: _labels.get(pid, pid),
     )
+    st.caption("已显示全部历史项目；刷新或换浏览器后不会再丢失。")
 
     st.caption("一次一问 · 结论先行 · 工单即状态")
 
