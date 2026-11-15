@@ -260,8 +260,8 @@ LLM_MODELS: tuple[str, ...] = (
 )
 DASHSCOPE_MODEL: str = read_setting("DASHSCOPE_MODEL", "qwen3.8-flash")
 # 工单是长文本，且 qwen/glm 会先输出 reasoning；
-# 2000 很容易被思考过程耗尽，导致正文过短甚至为空。
-LLM_MAX_OUTPUT_TOKENS: int = 4000
+# 4000 仍可能被较长思考过程挤占，给到 6000 留足正文空间。
+LLM_MAX_OUTPUT_TOKENS: int = 6000
 
 
 def _env_number(name: str, default: str, cast):
@@ -272,8 +272,8 @@ def _env_number(name: str, default: str, cast):
         return cast(default)
 
 
-# 工单生成长文本较慢，读超时给 120 秒；普通对话也够用
-LLM_TIMEOUT = _env_number("LLM_TIMEOUT", "120", float)
+# 工单生成长文本较慢（实测单张 70~90 秒），读超时给 180 秒，避免第二张起超时
+LLM_TIMEOUT = _env_number("LLM_TIMEOUT", "180", float)
 # 建连超时单独收紧：网络不通时 10 秒内失败并切换模型，避免页面长期无响应
 LLM_CONNECT_TIMEOUT = _env_number("LLM_CONNECT_TIMEOUT", "10", float)
 LLM_MAX_ATTEMPTS = max(1, int(_env_number("LLM_MAX_ATTEMPTS", "2", int)))  # 含首次在内的总尝试次数

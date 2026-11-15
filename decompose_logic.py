@@ -444,17 +444,39 @@ class PMSession:
         return "\n".join(lines)
 
     def generate_tickets(self, progress: Callable[[str], None] | None = None) -> list[Path]:
-        """第三阶段：逐模块生成 Markdown 工单并落盘（幂等 + 生成锁）。
+        """第三阶段：逐模块生成 Markdown 工单（断点续跑 + 单张重试）。
 
-        V3.3.1 变化：
-        - 增加 progress 回调，供 UI 用 st.status 展示「1/5、2/5」步进；
-        - 每张工单生成后先写入内存 generated_ticket_data；
-        - 数据库写入失败不拦用户，只标记 db_sync_failed，UI 用内存数据生成 ZIP。
+        V3.4.6 变化：
+        - 已有部分工单时不再整体拦截，只补齐缺失模块，支持第二张失败后继续；
+        - 每张工单失败自动重试一次（会顺带切换备用模型）；
+        - 单张失败不会删除前面已成功的工单。
         """
 
         def _notify(message: str) -> None:
             if progress:
                 progress(message)
+
+        def _chat_with_retry(user_content: str, label: str) -> str:
+            """单张工单最多尝试两次；额度耗尽立即停止，不重试。"""
+            last_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    return llm_client.chat_text(
+                        prompts.TICKET_PROMPT,
+                        user_content,
+                        progress=_notify,
+                    )
+                except llm_client.QuotaExceededError:
+                    raise
+                except llm_client.LLMError as exc:
+                    last_error = exc
+                    print(
+                        f"--- {label} 第 {attempt + 1} 次生成失败："
+                        f"{type(exc).__name__}: {str(exc)[:120]} ---"
+                    )
+                    if attempt == 0:
+                        time.sleep(2)
+            raise LogicError(f"{label} 生成失败，请重试") from None
 
         if not self.outline_confirmed or self.outline is None:
             raise LogicError("请先确认大纲，再生成工单")
@@ -462,15 +484,33 @@ class PMSession:
         paths_info = config.ensure_project_dirs(self.project_slug)
         tasks_dir = paths_info["tasks_dir"]
 
-        # 1) 幂等校验：已经生成过主工单就不再生成，避免重复 5 张
-        existing = [item for item in tasks_dir.glob("*.md") if not item.name.startswith("fix_")]
-        if existing:
+        # 1) 断点续跑：扫描已有工单，按模块名匹配，只补齐缺失部分
+        existing_files = [
+            item for item in tasks_dir.glob("*.md") if not item.name.startswith("fix_")
+        ]
+        existing_map: dict[str, str] = {}
+        for item in existing_files:
+            if config.RESEARCH_PREFIX in item.name:
+                existing_map[config.RESEARCH_PREFIX] = item.name
+                continue
+            for module in self.outline.modules:
+                if ticket_writer._slug(module.name) in item.name:
+                    existing_map[module.name] = item.name
+                    break
+
+        pending: list[tuple[str, Module | None]] = []
+        if self.outline.research_needed and config.RESEARCH_PREFIX not in existing_map:
+            pending.append((config.RESEARCH_PREFIX, None))
+        for module in self.outline.modules:
+            if module.name not in existing_map:
+                pending.append((module.kind, module))
+
+        if not pending:
             raise LogicError(
-                f"工单已存在（{len(existing)} 张），已拦截重复生成。"
-                "如需重做，请先清理 .tasks 目录。"
+                f"工单已全部生成（{len(existing_map)} 张），无需重复生成。"
             )
 
-        # 2) 生成锁：双击时只有一个请求能拿到锁，另一个直接收到提示
+        # 2) 生成锁：双击时只有一个请求能拿到锁
         lock_path = tasks_dir / ".generating.lock"
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -487,86 +527,109 @@ class PMSession:
             os.close(fd)
 
         paths: list[Path] = []
-        name_to_file: dict[str, str] = {}
+        # 已有模块 -> 文件名，供后续工单的依赖映射
+        name_to_file: dict[str, str] = {
+            name: filename
+            for name, filename in existing_map.items()
+            if name != config.RESEARCH_PREFIX
+        }
         self.generated_ticket_data = []
         self.db_sync_failed = False
-        total = len(self.outline.modules) + (1 if self.outline.research_needed else 0)
-        index = 0
+        total = len(pending)
         try:
-            _notify("正在读取你的需求描述...")
-            _notify("正在拆解功能模块...")
-
-            # 3) 前置调研工单（如需要）：作为第一张工单，后续模块可依赖它
-            if self.outline.research_needed:
-                index += 1
-                _notify(f"正在撰写工单 {index}/{total}...")
-                print(f"--- 正在请求大模型生成第 {index}/{total} 个工单（research）---")
-                body = llm_client.chat_text(
-                    prompts.TICKET_PROMPT,
-                    self._ticket_request(module=None, research=True, depends_files=[]),
-                    progress=_notify,
-                )
-                print(f"--- 成功拿到内容，长度 {len(body)}，准备写文件 ---")
-                try:
-                    path = ticket_writer.write_ticket(
-                        self.project_slug,
-                        self.outline.project_name,
-                        config.RESEARCH_PREFIX,
-                        f"前置调研：{self.outline.research_goal or '需求调研'}",
-                        body,
-                        depends_on=[],
-                    )
-                except ValueError as exc:
-                    print(f"--- 工单写入被拦截：{exc} ---")
-                    raise LogicError(
-                        f"AI 返回内容为空，已终止写入（第 {index} 张），请重试"
-                    ) from None
-                print(f"--- 已写入 {path.name} ---")
-                # 先放内存，再尝试入库；入库失败不拦用户
-                self.generated_ticket_data.append(
-                    {"filename": path.name, "type": config.RESEARCH_PREFIX, "content_md": body}
-                )
-                self._persist_ticket(path, config.RESEARCH_PREFIX, body)
-                paths.append(path)
-
-            # 4) 模块工单：逐个生成，依赖映射成文件名，绝不复制其他工单全文
-            for module in self.outline.modules:
-                index += 1
-                _notify(f"正在撰写工单 {index}/{total}...")
+            _notify(
+                f"检测到已有 {len(existing_map)} 张工单，准备补齐 {total} 张..."
+            )
+            for index, (kind, module) in enumerate(pending, 1):
+                label = "前置调研" if module is None else str(module.name)
+                _notify(f"正在撰写工单 {index}/{total}（{label}）...")
                 print(
-                    f"--- 正在请求大模型生成第 {index}/{total} 个工单"
-                    f"（{module.name} / {module.kind}）---"
+                    f"--- 正在请求大模型生成第 {index}/{total} 张工单（{label}）---"
                 )
-                depends_files = [
-                    name_to_file[name] for name in module.depends_on if name in name_to_file
-                ]
-                body = llm_client.chat_text(
-                    prompts.TICKET_PROMPT,
-                    self._ticket_request(module=module, research=False, depends_files=depends_files),
-                    progress=_notify,
-                )
-                print(f"--- 成功拿到内容，长度 {len(body)}，准备写文件 ---")
-                try:
-                    path = ticket_writer.write_ticket(
-                        self.project_slug,
-                        self.outline.project_name,
-                        module.kind,
-                        module.name,
-                        body,
-                        depends_on=depends_files,
+
+                if module is None:
+                    user_content = self._ticket_request(
+                        module=None, research=True, depends_files=[]
                     )
+                else:
+                    depends_files = [
+                        name_to_file[name]
+                        for name in module.depends_on
+                        if name in name_to_file
+                    ]
+                    user_content = self._ticket_request(
+                        module=module,
+                        research=False,
+                        depends_files=depends_files,
+                    )
+
+                try:
+                    body = _chat_with_retry(user_content, label)
+                    print(f"--- 成功拿到内容，长度 {len(body)}，准备写文件 ---")
+                    if module is None:
+                        path = ticket_writer.write_ticket(
+                            self.project_slug,
+                            self.outline.project_name,
+                            config.RESEARCH_PREFIX,
+                            f"前置调研：{self.outline.research_goal or '需求调研'}",
+                            body,
+                            depends_on=[],
+                        )
+                        self.generated_ticket_data.append(
+                            {
+                                "filename": path.name,
+                                "type": config.RESEARCH_PREFIX,
+                                "content_md": body,
+                            }
+                        )
+                        self._persist_ticket(path, config.RESEARCH_PREFIX, body)
+                    else:
+                        depends_files = [
+                            name_to_file[name]
+                            for name in module.depends_on
+                            if name in name_to_file
+                        ]
+                        path = ticket_writer.write_ticket(
+                            self.project_slug,
+                            self.outline.project_name,
+                            module.kind,
+                            module.name,
+                            body,
+                            depends_on=depends_files,
+                        )
+                        self.generated_ticket_data.append(
+                            {
+                                "filename": path.name,
+                                "type": module.kind,
+                                "content_md": body,
+                            }
+                        )
+                        self._persist_ticket(path, module.kind, body)
+                        name_to_file[module.name] = path.name
                 except ValueError as exc:
                     print(f"--- 工单写入被拦截：{exc} ---")
                     raise LogicError(
-                        f"AI 返回内容为空，已终止写入（第 {index} 张），请重试"
+                        f"第 {index} 张（{label}）内容为空，已终止写入；"
+                        "已保留前面成功的工单，可再次点击继续补齐。"
                     ) from None
-                print(f"--- 已写入 {path.name} ---")
-                self.generated_ticket_data.append(
-                    {"filename": path.name, "type": module.kind, "content_md": body}
-                )
-                self._persist_ticket(path, module.kind, body)
-                name_to_file[module.name] = path.name
+                except LogicError as exc:
+                    print(f"--- 第 {index} 张（{label}）失败：{exc} ---")
+                    raise LogicError(
+                        f"第 {index} 张（{label}）生成失败；"
+                        "已保留前面成功的工单，可再次点击「继续生成缺失工单」补齐。"
+                    ) from None
+                except Exception as exc:
+                    print(
+                        f"--- 第 {index} 张（{label}）异常："
+                        f"{type(exc).__name__}: {str(exc)[:160]} ---"
+                    )
+                    raise LogicError(
+                        f"第 {index} 张（{label}）生成异常；"
+                        "已保留前面成功的工单，可再次点击「继续生成缺失工单」补齐。"
+                    ) from None
+
                 paths.append(path)
+                print(f"--- 已写入 {path.name} ---")
 
             self.generated_tickets = [str(path) for path in paths]
             self.phase = config.PHASE_TICKETS

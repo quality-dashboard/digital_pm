@@ -640,21 +640,31 @@ with tab_tickets:
     active_project_id = _active_project_id(selected_project_id)
 
     if session and session.outline_confirmed and session.project_id == active_project_id:
-        # 只统计主工单（排除 fix_*.md）：已有主工单就禁止重复生成
+        # 已有部分工单时允许继续补齐，只有全部生成完才禁用按钮
         try:
             existing = project_store.repo.ticket_count(active_project_id, exclude_fix=True)
         except Exception:
             # 数据库暂不可用时不拦生成，后面用内存兜底
             existing = 0
+        total_expected = (
+            len(session.outline.modules) + (1 if session.outline.research_needed else 0)
+            if session.outline
+            else 0
+        )
+        pending_count = max(total_expected - existing, 0)
         if existing:
-            st.warning(
-                f"工单已存在（{existing} 张主工单），已禁止重复生成。"
-                "如需重做，请先清理数据库中的工单。"
-            )
+            if pending_count > 0:
+                st.warning(
+                    f"已生成 {existing}/{total_expected} 张主工单，"
+                    f"剩余 {pending_count} 张可继续补齐。"
+                )
+            else:
+                st.warning("工单已全部生成，无需重复生成。")
+        button_label = "一键生成工单" if existing == 0 else "继续生成缺失工单"
         if st.button(
-            "一键生成工单",
+            button_label,
             type="primary",
-            disabled=existing > 0 or _is_busy(),
+            disabled=pending_count <= 0 or _is_busy(),
             key="generate_tickets_btn",
         ):
             _quota_guard()
