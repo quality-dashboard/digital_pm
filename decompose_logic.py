@@ -317,6 +317,9 @@ class PMSession:
         if self.pending_question is None:
             raise LogicError("当前没有待回答的问题")
 
+        # 失败回滚快照：模型报错时必须恢复上一个可回答问题，避免卡成“无头案”
+        previous_question = self.pending_question
+        previous_round = self.round
         self.transcript.append({"role": "pm", "content": text})
         self.pending_question = None
         self.round += 1
@@ -327,7 +330,20 @@ class PMSession:
             session_store.save_state(self)
             return None
 
-        question = self._ask(progress)
+        try:
+            question = self._ask(progress)
+        except Exception:
+            # 回滚：恢复待回答问题、轮次与对话记录，页面继续显示回答框
+            self.pending_question = previous_question
+            self.round = previous_round
+            if (
+                self.transcript
+                and self.transcript[-1].get("role") == "pm"
+                and self.transcript[-1].get("content") == text
+            ):
+                self.transcript.pop()
+            raise
+
         if not question.need_more_info or not question.question.strip():
             self.phase = config.PHASE_OUTLINE
             session_store.save_state(self)

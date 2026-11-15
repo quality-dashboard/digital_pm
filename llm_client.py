@@ -33,6 +33,8 @@ MODELS: tuple[str, ...] = config.LLM_MODELS
 
 # 页面统一展示的友好提示：不包含 HTTP 状态码、路径、堆栈
 FRIENDLY_ERROR = "AI 服务当前繁忙，请稍后重试"
+# 所有模型重试后仍失败时的兜底文案（用户要求固定话术）
+FALLBACK_TEXT = "由于网络原因生成失败，请点击下方按钮重新生成。"
 
 # 进度旁白回调：由 UI 传入（例如更新 st.status），LLM 层只负责同步喊话
 ProgressFn = Callable[[str], None]
@@ -135,37 +137,47 @@ def _post(
         "Content-Type": "application/json",
     }
 
-    try:
-        # 建连超时单独收紧（默认 10s）：网络不通时快速失败并切备用模型，
-        # 读超时仍用 LLM_TIMEOUT（默认 90s），给正常长文本生成留足时间。
-        timeout = httpx.Timeout(config.LLM_TIMEOUT, connect=config.LLM_CONNECT_TIMEOUT)
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(url, headers=headers, json=payload)
-            # 兼容不支持 response_format 的网关：400 时去掉该参数重试一次
-            if response.status_code == 400 and json_mode:
-                payload.pop("response_format", None)
-                response = client.post(url, headers=headers, json=payload)
-    except httpx.TimeoutException:
-        # 超时单独抛出：上层据此播报「主模型超时，正在切换备用模型」
-        print(f"[llm] {model} 响应超时（>{config.LLM_TIMEOUT:.0f}s）")
-        raise LLMTimeoutError("模型响应超时") from None
-    except Exception as exc:
-        # 内部细节只写服务端日志，不进入页面
-        print(f"[llm] {model} 网络异常：{type(exc).__name__}: {str(exc)[:160]}")
-        raise LLMError("连接 AI 服务失败") from None
-
-    if response.status_code == 429:
-        print(f"[llm] {model} 触发 429 限流，等待 2 秒后重试一次")
-        time.sleep(2)
+    response = None
+    # 网络抖动（429 / 连接超时 / 读超时）最多自动重试 2 次（共 3 次）
+    for attempt in range(3):
         try:
+            # 建连超时单独收紧（默认 10s）：网络不通时快速失败并切备用模型，
+            # 读超时仍用 LLM_TIMEOUT（默认 180s），给正常长文本生成留足时间。
             timeout = httpx.Timeout(
                 config.LLM_TIMEOUT, connect=config.LLM_CONNECT_TIMEOUT
             )
             with httpx.Client(timeout=timeout) as client:
                 response = client.post(url, headers=headers, json=payload)
+                # 兼容不支持 response_format 的网关：400 时去掉该参数重试一次
+                if response.status_code == 400 and json_mode:
+                    payload.pop("response_format", None)
+                    response = client.post(url, headers=headers, json=payload)
+        except httpx.TimeoutException:
+            print(
+                f"[llm] {model} 响应超时（>{config.LLM_TIMEOUT:.0f}s，"
+                f"第 {attempt + 1}/3 次）"
+            )
+            if attempt < 2:
+                time.sleep(2)
+                continue
+            raise LLMTimeoutError("模型响应超时") from None
         except Exception as exc:
-            print(f"[llm] {model} 429 重试网络异常：{type(exc).__name__}: {str(exc)[:160]}")
+            print(
+                f"[llm] {model} 网络异常（第 {attempt + 1}/3 次）："
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            )
+            if attempt < 2:
+                time.sleep(2)
+                continue
             raise LLMError("连接 AI 服务失败") from None
+
+        if response.status_code == 429:
+            print(f"[llm] {model} 触发 429 限流（第 {attempt + 1}/3 次）")
+            if attempt < 2:
+                time.sleep(2)
+                continue
+            raise LLMError("AI 服务限流")
+        break
 
     if response.status_code in (402, 403):
         print(f"[llm] {model} 返回 HTTP {response.status_code}，疑似欠费/额度耗尽，停止请求")
@@ -249,9 +261,9 @@ def _call(
             else:
                 _notify(progress, "所有模型均未响应，正在整理提示…")
 
-    # 所有模型都失败：只给固定提示，绝不把底层异常/路径抛给页面
+    # 所有模型都失败：只给固定兜底文案，绝不把底层异常/路径抛给页面
     print(f"[llm] 模型池全部失败：{type(last_error).__name__ if last_error else 'unknown'}")
-    raise LLMError(FRIENDLY_ERROR)
+    raise LLMError(FALLBACK_TEXT)
 
 
 def _extract_json(text: str) -> dict:
