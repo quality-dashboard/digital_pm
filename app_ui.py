@@ -16,6 +16,7 @@ V3.1.1 关键变化：
 """
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 
 import streamlit as st
@@ -460,6 +461,43 @@ try:
             format_func=lambda pid: _labels.get(pid, pid),
         )
         st.caption("已显示全部历史项目；刷新或换浏览器后不会再丢失。")
+
+        if selected_project_id != "（新建项目）":
+            st.divider()
+            st.subheader("危险操作")
+            confirm_delete = st.checkbox(
+                f"我确认删除《{_labels.get(selected_project_id, selected_project_id)}》"
+                "及其所有工单和本地文件，删除后不可恢复",
+                key=f"delete_confirm_{selected_project_id}",
+            )
+            if st.button(
+                "删除当前项目",
+                type="secondary",
+                disabled=not confirm_delete or _is_busy(),
+                key=f"delete_project_{selected_project_id}",
+                use_container_width=True,
+            ):
+                try:
+                    project = project_store.repo.get_project(selected_project_id)
+                    project_name = str(project.get("name", "")) if project else ""
+                    slug = config.slugify_project_name(project_name) if project_name else ""
+                    project_store.repo.delete_project(selected_project_id)
+                    if slug:
+                        shutil.rmtree(
+                            config.project_paths(slug)["project_dir"],
+                            ignore_errors=True,
+                        )
+                    current = _session()
+                    if current and current.project_id == selected_project_id:
+                        st.session_state.pop("pm_session", None)
+                        st.session_state.pop("restored_from", None)
+                    st.session_state.pop("tickets", None)
+                    st.session_state.pop("tickets_project_id", None)
+                    st.success("项目已删除")
+                    st.rerun()
+                except Exception as exc:
+                    print(f"[ui] 删除项目失败：{type(exc).__name__}: {str(exc)[:160]}")
+                    st.error("删除失败，请稍后重试。")
 
         st.caption("一次一问 · 结论先行 · 工单即状态")
 

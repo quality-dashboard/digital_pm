@@ -335,6 +335,15 @@ class ProjectRepository:
             (project_id,),
         )
 
+    def delete_project(self, project_id: str) -> None:
+        """删除项目及其全部工单。
+
+        先删 tickets 再删 projects，兼容未开启外键级联的数据库；
+        删除后不可恢复，UI 侧必须二次确认。
+        """
+        self._db.execute("DELETE FROM tickets WHERE project_id = ?", (project_id,))
+        self._db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
 
 # 模块级单例：UI 直接 project_store.repo.list_projects(...) 即可
 repo = ProjectRepository()
