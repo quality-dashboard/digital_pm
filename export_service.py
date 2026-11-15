@@ -35,6 +35,27 @@ def _safe_name(text: str, fallback: str = "project", limit: int = 40) -> str:
     return (cleaned or fallback)[:limit]
 
 
+# 每个 ZIP 强制附带的「保姆级」新手指南：不是工单，但能显著降低新手放弃率
+NEWBIE_GUIDE = """# 🚀 新手开发环境配置与实战指南
+
+恭喜你拿到了系统的施工图纸！这份指南能帮你避开 99% 的新手坑。
+
+## 第一步：安装你的“数字包工头” (IDE)
+1. 推荐工具：Trae 或 CodeBuddy（在官网免费下载）。
+2. 安装路径：建议默认安装。安装完成后，用微信扫码登录。
+
+## 第二步：怎么让 AI 替你写代码？
+1. 在 Trae 中新建一个空文件夹（命名为你的项目名）。
+2. 打开我们为你生成的 `01_数据库设计.md`，把全文复制，粘贴到 Trae 的对话框，输入：“请根据这份文档，帮我建库建表”。
+3. 依次打开 `02_后端逻辑.md` 和 `03_前端界面.md`，同样复制粘贴给 AI。等它写完，再喂下一个，千万不要一次性全丢进去。
+
+## 第三步：遇到红字报错怎么办？（最重要）
+1. 如果终端出现一堆红色的英文报错，**不要慌，也不要乱改代码**。
+2. 直接选中报错的那几行红字，右键复制。
+3. 回到 Trae 的对话框，粘贴报错，加上一句：“我遇到了这个报错，请帮我修复”。AI 会告诉你缺什么依赖，或者该怎么配环境。
+"""
+
+
 def build_zip_from_tickets(
     tickets: list[dict],
     project_name: str = "project",
@@ -64,6 +85,11 @@ def build_zip_from_tickets(
                     f"{safe_project}/.tasks/{filename}",
                     ticket.get("content_md", ""),
                 )
+            # 强制附带新手指南：与 .tasks 同级，解压后第一眼就能看到
+            archive.writestr(
+                f"{safe_project}/必读_新手开发环境指南.md",
+                NEWBIE_GUIDE,
+            )
     except Exception:
         # 固定提示，不把打包底层异常返回页面
         raise ExportError("打包 ZIP 失败，请稍后重试") from None

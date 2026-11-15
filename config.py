@@ -140,6 +140,8 @@ TECH_RULES: dict[str, tuple[str, ...]] = {
         "验收清单必须写成产品经理可执行的步骤：点击 / 输入 / 验证状态流转",
         "跨工单只传依赖文件名，不复制其他工单全文（上下文强隔离）",
         "工单必须标注建议执行平台（Trae / CodeBuddy / WorkBuddy）",
+        "架构树必须用 Markdown 缩进列表（├── / └──）表达，严禁输出 Mermaid 代码块",
+        "数据库建表 SQL / 表结构必须在字段旁用中文括号注释，例如 id (系统编号)、username (用户昵称)",
     ),
     "安全边界": (
         "只允许改动工单指定范围内的文件；工单目录之外一律不动",
@@ -269,7 +271,9 @@ def _env_number(name: str, default: str, cast):
         return cast(default)
 
 
-LLM_TIMEOUT = _env_number("LLM_TIMEOUT", "90", float)                 # 单次请求超时（秒）
+LLM_TIMEOUT = _env_number("LLM_TIMEOUT", "90", float)                 # 单次请求读超时（秒）
+# 建连超时单独收紧：网络不通时 10 秒内失败并切换模型，避免页面长期无响应
+LLM_CONNECT_TIMEOUT = _env_number("LLM_CONNECT_TIMEOUT", "10", float)
 LLM_MAX_ATTEMPTS = max(1, int(_env_number("LLM_MAX_ATTEMPTS", "2", int)))  # 含首次在内的总尝试次数
 LLM_TEMPERATURE = _env_number("LLM_TEMPERATURE", "0.3", float)        # 拆解需要稳定输出
 MAX_TICKET_CHARS: int = 12000     # 单张工单文本上限，超出截断并提示

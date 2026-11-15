@@ -16,6 +16,8 @@ V3.1.1 关键变化：
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import streamlit as st
 
 # -----------------------------------------------------------------------------
@@ -49,6 +51,11 @@ _PHASE_LABELS = {
     config.PHASE_TICKETS: "工单已生成",
     config.PHASE_BUG: "报错回流",
 }
+
+# 需求文本长度约束：
+# 下限 20 字拦截「做个系统」这类无信息量输入，上限 8000 字防止超长文本打爆大模型 Token
+REQ_MIN_CHARS = 20
+REQ_MAX_CHARS = 8000
 
 
 # =============================================================================
@@ -145,6 +152,23 @@ def _is_busy() -> bool:
     return bool(st.session_state.get("busy_phase"))
 
 
+def _status_progress(status) -> Callable[[str], None]:
+    """把 LLM 层的进度旁白接到 st.status，避免长请求看起来像「页面卡死」。
+
+    每次收到消息做两件事：
+    1. 更新 status 标题（用户一眼看到当前在做什么）；
+    2. 追加一行旁白历史（事后能看到「主模型超时、已切备用模型」的完整过程）。
+
+    只做同步更新，不启后台线程：Streamlit 的元素更新必须发生在脚本主线程。
+    """
+
+    def _report(message: str) -> None:
+        status.update(label=message)
+        st.caption(f"· {message}")
+
+    return _report
+
+
 def _quota_guard() -> None:
     """全局每日配额：超过 100 次直接拦截，保护 API 额度。
 
@@ -208,52 +232,47 @@ def _depends_from_content(text: str) -> str:
 
 
 @st.fragment
-def render_conversation() -> None:
-    """需求与追问的对话流（fragment 包裹，减少交互时的整页闪烁）。
+def render_chat() -> None:
+    """ChatGPT 式对话流：欢迎语 + 历史消息 + 快捷选项 + chat_input。
 
-    只做展示与调用既有状态机方法：
-    - 追问卡片使用主题组件；
-    - 提交回答后调用全量 st.rerun()，让侧边栏进度条和 Header 阶段一起更新。
+    只做展示与调用既有状态机方法，不改变追问/大纲/工单的业务规则。
     """
     session = _session()
-    if not session:
+
+    # 首次进入的主动打招呼（常驻在对话开头）
+    with st.chat_message("assistant"):
+        st.write("你好，我是你的数字项目经理。你想开发什么应用？随便说，多离谱都行。")
+
+    # 历史对话：pm -> user，其余 -> assistant
+    if session:
+        for item in session.transcript:
+            with st.chat_message("user" if item["role"] == "pm" else "assistant"):
+                st.write(item["content"])
+
+    # 合规勾选：未勾选不展示输入框，避免用户直接发送
+    agree = st.checkbox(
+        "我已阅读并同意：本工具会保存你的需求记录 30 天用于进度恢复，不会收集您的个人身份信息。",
+        key="consent_agree",
+    )
+    if not agree:
+        st.caption("勾选上方同意项后，即可开始对话。")
         return
 
-    st.divider()
-    # 对话流：产品经理的回答与系统的追问交替展示
-    for item in session.transcript:
-        with st.chat_message("user" if item["role"] == "pm" else "assistant"):
-            st.write(item["content"])
+    # 追问快捷选项：模型给出 options 时，用户可一键发送
+    if session and session.pending_question and session.pending_question.options:
+        st.caption("不想打字？直接点一个方向：")
+        option_cols = st.columns(min(len(session.pending_question.options), 3))
+        for index, option in enumerate(session.pending_question.options):
+            if option_cols[index % len(option_cols)].button(
+                option,
+                key=f"quick_option_{session.round}_{index}",
+                disabled=_is_busy(),
+                use_container_width=True,
+            ):
+                _handle_chat_message(session, option)
 
-    if session.pending_question:
-        question = session.pending_question
-        # 主题追问卡片，替代原生 st.info
-        ui_theme.render_question(question.question, question.reason, question.options)
-        if question.auto_trimmed:
-            st.caption("（模型原本给了多个问句，已自动收敛为 1 个）")
-
-        answer = st.text_input("你的回答", key=f"answer_input_{session.round}")
-        if st.button("提交回答", type="primary", disabled=_is_busy()):
-            if not answer.strip():
-                st.warning("回答不能为空")
-            else:
-                _quota_guard()
-                _begin_busy("answer")
-                ok = False
-                with st.spinner("已记录，正在判断是否还需要追问……"):
-                    try:
-                        session.answer(answer.strip())
-                        _store(session)
-                        ok = True
-                    except Exception as exc:
-                        st.error(_error_text(exc, "提交失败，请稍后重试"))
-                    finally:
-                        _end_busy()
-                if ok:
-                    # 全量刷新：侧边栏进度条与 Header 阶段需要同步更新
-                    st.rerun()
-
-        # 逃生门：不想继续被追问，直接进入大纲阶段（仍会消耗一次配额）
+    # 逃生门：不想继续被追问，直接进入大纲
+    if session and session.pending_question:
         if st.button(
             "赶时间？跳过追问，直接生成大纲 →",
             disabled=_is_busy(),
@@ -272,75 +291,56 @@ def render_conversation() -> None:
                 _end_busy()
             if ok:
                 st.rerun()
-    elif session.phase in (
-        config.PHASE_OUTLINE,
-        config.PHASE_CONFIRMED,
-        config.PHASE_TICKETS,
-    ):
-        st.success("追问已完成，信息足够，请去「② 大纲确认」。")
+
+    # 聊天输入框：首条创建会话，后续作为追问回答
+    prompt = st.chat_input("说说你的想法，多离谱都行……")
+    if prompt:
+        _handle_chat_message(session, prompt)
 
 
-@st.fragment
-def render_requirement_form() -> None:
-    """首屏引导 + 需求输入 + 合规勾选。
+def _handle_chat_message(session: decompose_logic.PMSession | None, text: str) -> None:
+    """处理一条聊天消息：首条创建 PMSession，之后作为追问回答。
 
-    包进 fragment：输入需求时只重跑这一块，字数统计实时更新，不整页闪烁。
+    输入长度、每日配额、生成锁都在这里统一拦截；成功后全量 rerun，
+    让侧边栏进度条与 Header 阶段同步更新。
     """
-    with st.container(border=True):
-        st.markdown("### 一句话想法，5 张可开工的工单。")
-        st.caption(
-            "① 描述产品想法 → ② AI 帮你追问细节 → "
-            "③ 生成结构化 Markdown 工单，直接丢给开发者或 AI 编码助手。"
+    content = (text or "").strip()
+    if not content:
+        return
+    if session is None and len(content) < REQ_MIN_CHARS:
+        st.error(
+            f"再多说一点：至少 {REQ_MIN_CHARS} 字（当前 {len(content)} 字）。"
+            "补充目标用户和核心功能，AI 才能给出有价值的追问。"
         )
+        return
+    if len(content) > REQ_MAX_CHARS:
+        st.error(f"内容太长了：最多 {REQ_MAX_CHARS} 字，请精简后再发送。")
+        return
 
-    requirement = st.text_area(
-        "需求描述（模糊也可以，我来追问）",
-        height=160,
-        key="requirement_input",
-        max_chars=8000,
-        placeholder="例如：做一个简历优化工具，能上传简历并给出修改建议……",
-    )
-    st.caption(f"已输入 {len(requirement)} / 8000 字")
-
-    project_name_input = st.text_input(
-        "项目名（可选，留空则由大纲自动命名）",
-        key="project_name_input",
-    )
-
-    agree = st.checkbox(
-        "我已阅读并同意：本工具会保存你的需求记录 30 天用于进度恢复，不会收集您的个人身份信息。",
-        key="consent_agree",
-    )
-
-    if st.button(
-        "初步分析",
-        type="primary",
-        disabled=_is_busy() or not agree,
-        use_container_width=True,
-    ):
-        if not requirement.strip():
-            st.warning("请先填写需求描述")
-        else:
-            _quota_guard()
-            _begin_busy("clarify")
-            ok = False
-            with st.spinner("正在分析需求盲点……"):
-                try:
-                    session = decompose_logic.PMSession(
-                        requirement=requirement.strip(),
-                        project_name=project_name_input.strip(),
-                        session_id=session_id,
-                    )
-                    session.start()
-                    _store(session)
-                    st.session_state.pop("restored_from", None)
-                    ok = True
-                except Exception as exc:
-                    st.error(_error_text(exc, "分析失败，请稍后重试"))
-                finally:
-                    _end_busy()
-            if ok:
-                st.rerun()
+    _quota_guard()
+    _begin_busy("chat")
+    ok = False
+    with st.status("正在思考……", expanded=True) as status:
+        try:
+            if session is None:
+                session = decompose_logic.PMSession(
+                    requirement=content,
+                    session_id=session_id,
+                )
+                session.start(progress=_status_progress(status))
+                st.session_state.pop("restored_from", None)
+            else:
+                session.answer(content, progress=_status_progress(status))
+            _store(session)
+            ok = True
+            status.update(label="思考完成", state="complete", expanded=False)
+        except Exception as exc:
+            status.update(label="处理失败", state="error")
+            st.error(_error_text(exc, "发送失败，请稍后重试"))
+        finally:
+            _end_busy()
+    if ok:
+        st.rerun()
 
 
 # 首次加载：按 session_id 从数据库恢复最近项目（项目级状态，不含对话）
@@ -437,9 +437,8 @@ tab_ask, tab_outline, tab_tickets, tab_bug = st.tabs(
 # ① 需求与追问
 # =============================================================================
 with tab_ask:
-    # 输入区与对话流都走 fragment：输入/回答只重跑局部，减少整页闪烁
-    render_requirement_form()
-    render_conversation()
+    # 对话式主界面：欢迎语、历史消息、快捷选项与 chat_input 都在同一个 fragment 内
+    render_chat()
 
 # =============================================================================
 # ② 大纲确认
@@ -455,12 +454,14 @@ with tab_outline:
             _quota_guard()
             _begin_busy("outline")
             ok = False
-            with st.spinner("正在生成 3~4 个模块的大纲……"):
+            with st.status("正在生成 3~4 个模块的大纲……", expanded=True) as status:
                 try:
-                    session.build_outline()
+                    session.build_outline(progress=_status_progress(status))
                     _store(session)
                     ok = True
+                    status.update(label="大纲生成完成", state="complete", expanded=False)
                 except Exception as exc:
+                    status.update(label="生成失败", state="error")
                     st.error(_error_text(exc, "生成大纲失败，请稍后重试"))
                 finally:
                     _end_busy()
@@ -578,7 +579,17 @@ def render_ticket_board(project_id: str) -> None:
                 # 详情保持原生 Markdown 渲染，代码高亮与转义由 Streamlit 负责
                 st.markdown(item["content_md"])
 
-    # 防空守卫：优先用内存数据打包；无工单或 ZIP 太小都禁用下载
+    # 下载前免责声明与安全锁：这是工单图纸，不是成品软件
+    st.warning(
+        "⚠️ 注意：你获取的是开发图纸，不是成品软件。"
+        "请使用 Trae/CodeBuddy 等工具按图纸施工，遇报错请直接问 AI，本服务不包环境配置。"
+    )
+    agree_download = st.checkbox(
+        "我已了解：我拿到的是工单图纸，我需要自己指挥AI写代码",
+        key=f"download_agree_{project_id}",
+    )
+
+    # 防空守卫：优先用内存数据打包；无工单/ZIP 太小/未勾选都禁用下载
     zip_bytes = b""
     zip_name = f"{project.get('name', 'project')}_tickets.zip".replace(" ", "-")
     if tickets:
@@ -592,7 +603,8 @@ def render_ticket_board(project_id: str) -> None:
         except export_service.ExportError:
             zip_bytes = b""
 
-    download_ready = bool(tickets) and len(zip_bytes) >= 100
+    zip_ready = bool(tickets) and len(zip_bytes) >= 100
+    download_ready = zip_ready and agree_download
     st.download_button(
         "📥 下载全部工单 (.zip)",
         data=zip_bytes if download_ready else b"",
@@ -602,8 +614,10 @@ def render_ticket_board(project_id: str) -> None:
         use_container_width=True,
         disabled=not download_ready,
     )
-    if not download_ready:
+    if not zip_ready:
         st.caption("暂无工单可下载")
+    elif not agree_download:
+        st.caption("请先勾选上方确认项，再下载。")
 
     # 微信/手机下载兜底：直接把工单全文摊开，可逐张复制
     with st.expander("👇 若无法下载，请直接在此复制工单全文"):
@@ -643,7 +657,7 @@ with tab_tickets:
             with st.status("正在生成工单...", expanded=True) as status:
                 try:
                     paths = session.generate_tickets(
-                        progress=lambda message: status.update(label=message)
+                        progress=_status_progress(status)
                     )
                     _store(session)
                     # 内存兜底：数据库超时也能下载
@@ -692,18 +706,21 @@ with tab_bug:
                 _quota_guard()
                 _begin_busy("fix")
                 ok = False
-                with st.spinner("正在结合项目上下文生成修复工单……"):
+                with st.status("正在结合项目上下文生成修复工单……", expanded=True) as status:
                     try:
                         slug = _project_slug(active_project_id) or active_project_id
                         path = decompose_logic.generate_fix_ticket(
                             slug,
                             log_text,
                             project_id=active_project_id,
+                            progress=_status_progress(status),
                         )
+                        status.update(label="Fix 工单生成完成", state="complete", expanded=False)
                         st.success(f"已生成：{path.name}")
                         st.markdown(path.read_text(encoding="utf-8", errors="replace"))
                         ok = True
                     except Exception as exc:
+                        status.update(label="生成失败", state="error")
                         st.error(_error_text(exc, "生成失败，请稍后重试"))
                     finally:
                         _end_busy()
