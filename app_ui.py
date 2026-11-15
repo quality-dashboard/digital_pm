@@ -34,6 +34,7 @@ import decompose_logic  # noqa: E402
 import export_service  # noqa: E402
 import llm_client  # noqa: E402
 import project_store  # noqa: E402
+import schemas  # noqa: E402
 import ui_theme  # noqa: E402
 
 # 全局注入 UI/UX 主题：set_page_config 之后第一件事，必须在任何业务组件之前
@@ -131,6 +132,9 @@ _SAFE_ERRORS = (
 
 def _error_text(exc: Exception, fallback: str = "操作失败，请稍后重试") -> str:
     """把异常转换成页面可展示的短中文提示。"""
+    if isinstance(exc, schemas.SchemaError):
+        # 模型 JSON 结构不符合约定：给用户可理解的提示，不展示字段级细节
+        return "AI 返回格式异常，请重试"
     if isinstance(exc, _SAFE_ERRORS):
         message = str(exc).strip()
         return message[:300] if message else fallback
@@ -335,6 +339,8 @@ def _handle_chat_message(session: decompose_logic.PMSession | None, text: str) -
             ok = True
             status.update(label="思考完成", state="complete", expanded=False)
         except Exception as exc:
+            # 服务端记录真实异常类型，页面仍只显示固定中文提示
+            print(f"[ui] 聊天处理失败：{type(exc).__name__}: {str(exc)[:160]}")
             status.update(label="处理失败", state="error")
             st.error(_error_text(exc, "发送失败，请稍后重试"))
         finally:

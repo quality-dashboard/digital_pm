@@ -249,13 +249,13 @@ class Database:
     # 健康检查
     # ------------------------------------------------------------------
     def healthcheck(self) -> str:
-        """返回连接状态，供 UI 排查；异常不抛出，只返回可读文本。"""
+        """返回连接状态，供 UI 展示；异常不抛出，也不把底层细节带到页面。"""
         try:
             self.query("SELECT 1 AS ok")
-            suffix = f" ｜ 已降级：{self.fallback_reason[:120]}" if self.fallback_reason else ""
+            suffix = " ｜ 已降级本地 SQLite" if self.fallback_reason else ""
             return f"ok ({self._backend}){suffix}"
-        except Exception as exc:  # 数据库不可达不应该让页面直接崩
-            return f"error ({self._backend}): {type(exc).__name__}: {exc}"
+        except Exception:  # 数据库不可达不应该让页面直接崩
+            return f"error ({self._backend})"
 
 
 # 模块级单例：整个 Streamlit 进程共用一个连接池/连接
