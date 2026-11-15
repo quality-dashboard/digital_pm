@@ -296,10 +296,21 @@ def render_chat() -> None:
             if ok:
                 st.rerun()
 
-    # 聊天输入框：首条创建会话，后续作为追问回答
-    prompt = st.chat_input("说说你的想法，多离谱都行……")
-    if prompt:
-        _handle_chat_message(session, prompt)
+    # 聊天输入框：只有「还没有会话」或「有待回答问题」时才允许输入；
+    # 追问结束后不再把用户输入当成回答，避免“当前没有待回答的问题”。
+    can_chat = session is None or session.pending_question is not None
+    if can_chat:
+        prompt = st.chat_input("说说你的想法，多离谱都行……")
+        if prompt:
+            _handle_chat_message(session, prompt)
+    elif session and session.phase in (
+        config.PHASE_OUTLINE,
+        config.PHASE_CONFIRMED,
+        config.PHASE_TICKETS,
+    ):
+        st.success("追问已完成，信息足够，请去「② 大纲确认」或「③ 产品说明书」。")
+    elif session:
+        st.info("当前没有待回答的问题；如需新项目，请点侧边栏「（新建项目）」。")
 
 
 def _handle_chat_message(session: decompose_logic.PMSession | None, text: str) -> None:
@@ -310,6 +321,13 @@ def _handle_chat_message(session: decompose_logic.PMSession | None, text: str) -
     """
     content = (text or "").strip()
     if not content:
+        return
+    if session is not None and session.pending_question is None:
+        # 追问已完成/被跳过：不再把新消息当回答，避免 LogicError
+        st.info(
+            "当前没有待回答的问题，请去「② 大纲确认」或「③ 产品说明书」；"
+            "如需新项目，请点侧边栏「（新建项目）」。"
+        )
         return
     if session is None and len(content) < REQ_MIN_CHARS:
         st.error(
