@@ -167,7 +167,19 @@ def _post(system_prompt: str, user_content: str, json_mode: bool, model: str) ->
 
     try:
         body = response.json()
-        return body["choices"][0]["message"]["content"]
+        message = body["choices"][0]["message"]
+        content = str(message.get("content") or "")
+        reasoning = str(message.get("reasoning_content") or "")
+        print(
+            f"[llm] {model} 返回：content={len(content)} 字符 / "
+            f"reasoning={len(reasoning)} 字符"
+        )
+        if not content.strip() and reasoning:
+            print(
+                f"[llm] {model} 正文为空但思考内容 {len(reasoning)} 字符，"
+                "可能是 max_tokens 被思考过程耗尽"
+            )
+        return content
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         print(f"[llm] {model} 返回结构异常：{type(exc).__name__}")
         raise LLMError("AI 返回结构异常") from None

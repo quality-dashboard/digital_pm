@@ -259,8 +259,9 @@ LLM_MODELS: tuple[str, ...] = (
     "deepseek-v4.1-flash",
 )
 DASHSCOPE_MODEL: str = read_setting("DASHSCOPE_MODEL", "qwen3.8-flash")
-# 单次请求最大输出 token：严格封顶，防止模型输出过长导致费用失控
-LLM_MAX_OUTPUT_TOKENS: int = 2000
+# 工单是长文本，且 qwen/glm 会先输出 reasoning；
+# 2000 很容易被思考过程耗尽，导致正文过短甚至为空。
+LLM_MAX_OUTPUT_TOKENS: int = 4000
 
 
 def _env_number(name: str, default: str, cast):
@@ -271,8 +272,8 @@ def _env_number(name: str, default: str, cast):
         return cast(default)
 
 
-# 用户要求：读超时统一 60 秒，避免长文本生成被过早切断
-LLM_TIMEOUT = _env_number("LLM_TIMEOUT", "60", float)
+# 工单生成长文本较慢，读超时给 120 秒；普通对话也够用
+LLM_TIMEOUT = _env_number("LLM_TIMEOUT", "120", float)
 # 建连超时单独收紧：网络不通时 10 秒内失败并切换模型，避免页面长期无响应
 LLM_CONNECT_TIMEOUT = _env_number("LLM_CONNECT_TIMEOUT", "10", float)
 LLM_MAX_ATTEMPTS = max(1, int(_env_number("LLM_MAX_ATTEMPTS", "2", int)))  # 含首次在内的总尝试次数
