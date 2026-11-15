@@ -439,7 +439,7 @@ if st.session_state.get("restored_from") and _session():
     )
 
 tab_ask, tab_outline, tab_tickets, tab_bug = st.tabs(
-    ["① 需求与追问", "② 大纲确认", "③ 工单看板", "④ Bug 修复"]
+    ["① 需求与追问", "② 大纲确认", "③ 产品说明书", "④ Bug 修复"]
 )
 
 # =============================================================================
@@ -554,10 +554,16 @@ def render_ticket_board(project_id: str) -> None:
         st.caption("项目不存在或已被删除。")
         return
 
-    st.subheader(f"工单看板：{project['name']}（{len(tickets)} 张）")
+    prd_tickets = [
+        item
+        for item in tickets
+        if item["filename"] == "产品需求说明书.md" or item.get("type") == "prd"
+    ]
+    display_tickets = prd_tickets or tickets
+    st.subheader(f"产品说明书预览：{project['name']}")
 
-    if not tickets:
-        st.caption("当前项目还没有工单。")
+    if not display_tickets:
+        st.caption("还没有产品说明书，请在上方点击「生成小白专属需求说明书」。")
         return
 
     # 微信生态兜底：微信内置浏览器经常拦截 ZIP 下载
@@ -566,56 +572,41 @@ def render_ticket_board(project_id: str) -> None:
         "若点击无反应，请点右上角『···』选择『在浏览器打开』。"
     )
 
-    # 双列卡片展示工单头部；详情仍用 expander + Markdown，保留语法高亮
-    ticket_columns = st.columns(2)
-    for index, item in enumerate(tickets, 1):
-        title = _first_heading(item["content_md"]) or item["filename"]
-        with ticket_columns[(index - 1) % 2]:
-            st.markdown(
-                ui_theme.ticket_card_head(
-                    {
-                        "index": index,
-                        "title": title,
-                        "name": item["filename"],
-                        "kind": item["type"],
-                        "depends_on": _depends_from_content(item["content_md"]),
-                        "updated_at": item.get("created_at", ""),
-                    }
-                ),
-                unsafe_allow_html=True,
-            )
-            with st.expander("查看详情"):
-                # 详情保持原生 Markdown 渲染，代码高亮与转义由 Streamlit 负责
+    if prd_tickets:
+        # V4：直接渲染大白话说明书，不再用技术工单卡片
+        for item in prd_tickets:
+            st.markdown(item["content_md"])
+    else:
+        # 旧项目兼容：仍显示历史技术工单
+        st.caption("当前项目还是旧版技术工单，建议重新生成产品说明书。")
+        for item in tickets:
+            with st.expander(item["filename"]):
                 st.markdown(item["content_md"])
 
-    # 下载前免责声明与安全锁：这是工单图纸，不是成品软件
+    # 下载前免责声明与安全锁：这是说明书，不是成品软件
     st.warning(
-        "⚠️ 注意：你获取的是开发图纸，不是成品软件。"
-        "请使用 Trae/CodeBuddy 等工具按图纸施工，遇报错请直接问 AI，本服务不包环境配置。"
+        "⚠️ 这是产品说明书，不是成品软件。"
+        "请把它交给 WorkBuddy 的【微信小程序开发专家团】生成小程序。"
     )
     agree_download = st.checkbox(
-        "我已了解：我拿到的是工单图纸，我需要自己指挥AI写代码",
+        "我已了解：我拿到的是产品说明书，需要交给 WorkBuddy 生成小程序",
         key=f"download_agree_{project_id}",
     )
 
-    # 防空守卫：优先用内存数据打包；无工单/ZIP 太小/未勾选都禁用下载
     zip_bytes = b""
-    zip_name = f"{project.get('name', 'project')}_tickets.zip".replace(" ", "-")
-    if tickets:
+    zip_name = f"{project.get('name', 'project')}_产品说明书.zip".replace(" ", "-")
+    if display_tickets:
         try:
-            if db_error or memory_tickets:
-                zip_bytes, zip_name = export_service.build_zip_from_tickets(
-                    tickets, project.get("name", "project")
-                )
-            else:
-                zip_bytes, zip_name = export_service.build_tickets_zip(project_id)
+            zip_bytes, zip_name = export_service.build_zip_from_tickets(
+                display_tickets, project.get("name", "project")
+            )
         except export_service.ExportError:
             zip_bytes = b""
 
-    zip_ready = bool(tickets) and len(zip_bytes) >= 100
+    zip_ready = bool(display_tickets) and len(zip_bytes) >= 100
     download_ready = zip_ready and agree_download
     st.download_button(
-        "📥 下载全部工单 (.zip)",
+        "📥 下载产品说明书 (.zip)",
         data=zip_bytes if download_ready else b"",
         file_name=zip_name,
         mime="application/zip",
@@ -624,13 +615,12 @@ def render_ticket_board(project_id: str) -> None:
         disabled=not download_ready,
     )
     if not zip_ready:
-        st.caption("暂无工单可下载")
+        st.caption("暂无可下载的说明书")
     elif not agree_download:
         st.caption("请先勾选上方确认项，再下载。")
 
-    # 微信/手机下载兜底：直接把工单全文摊开，可逐张复制
-    with st.expander("👇 若无法下载，请直接在此复制工单全文"):
-        for item in tickets:
+    with st.expander("👇 若无法下载，请直接在此复制说明书全文"):
+        for item in display_tickets:
             st.markdown(f"**{item['filename']}**")
             st.code(item["content_md"], language="markdown")
 
@@ -643,54 +633,43 @@ with tab_tickets:
     active_project_id = _active_project_id(selected_project_id)
 
     if session and session.outline_confirmed and session.project_id == active_project_id:
-        # 已有部分工单时允许继续补齐，只有全部生成完才禁用按钮
+        # V4：只生成一份产品说明书；已存在时允许覆盖重生成
         try:
-            existing = project_store.repo.ticket_count(active_project_id, exclude_fix=True)
+            project_tickets = project_store.repo.list_tickets(active_project_id)
         except Exception:
-            # 数据库暂不可用时不拦生成，后面用内存兜底
-            existing = 0
-        total_expected = (
-            len(session.outline.modules) + (1 if session.outline.research_needed else 0)
-            if session.outline
-            else 0
+            project_tickets = []
+        prd_exists = any(
+            item["filename"] == "产品需求说明书.md" or item.get("type") == "prd"
+            for item in project_tickets
         )
-        pending_count = max(total_expected - existing, 0)
-        if existing:
-            if pending_count > 0:
-                st.warning(
-                    f"已生成 {existing}/{total_expected} 张主工单，"
-                    f"剩余 {pending_count} 张可继续补齐。"
-                )
-            else:
-                st.warning("工单已全部生成，无需重复生成。")
-        button_label = "一键生成工单" if existing == 0 else "继续生成缺失工单"
+        if prd_exists:
+            st.info("已生成过产品说明书；重新生成会覆盖旧版本。")
+        button_label = "重新生成产品说明书" if prd_exists else "生成小白专属需求说明书"
         if st.button(
             button_label,
             type="primary",
-            disabled=pending_count <= 0 or _is_busy(),
-            key="generate_tickets_btn",
+            disabled=_is_busy(),
+            key="generate_prd_btn",
         ):
             _quota_guard()
-            _begin_busy("tickets")
+            _begin_busy("prd")
             ok = False
-            with st.status("正在生成工单...", expanded=True) as status:
+            with st.status("正在把你的想法翻译成产品说明书...", expanded=True) as status:
                 try:
-                    paths = session.generate_tickets(
-                        progress=_status_progress(status)
-                    )
+                    path = session.generate_prd(progress=_status_progress(status))
                     _store(session)
                     # 内存兜底：数据库超时也能下载
                     st.session_state["tickets"] = list(session.generated_ticket_data)
                     st.session_state["tickets_project_id"] = session.project_id
                     if session.db_sync_failed:
                         st.session_state["cloud_sync_warning"] = (
-                            "云端暂存失败，请立即下载 ZIP 保存到本地"
+                            "云端暂存失败，请立即下载说明书保存到本地"
                         )
-                    status.update(label="工单生成完成", state="complete", expanded=False)
+                    status.update(label="产品说明书生成完成", state="complete", expanded=False)
                     ok = True
                 except Exception as exc:
                     status.update(label="生成失败", state="error")
-                    st.error(_error_text(exc, "生成工单失败，请稍后重试"))
+                    st.error(_error_text(exc, "生成失败，请稍后重试"))
                 finally:
                     _end_busy()
             if ok:

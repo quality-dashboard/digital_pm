@@ -443,6 +443,101 @@ class PMSession:
         )
         return "\n".join(lines)
 
+    def generate_prd(self, progress: Callable[[str], None] | None = None) -> Path:
+        """V4.0：生成一份大白话产品需求说明书（PRD）。
+
+        - 不注入技术/代码规则，只输出功能清单、操作流程、验收清单；
+        - 末尾由代码强制追加 WorkBuddy / 微信小程序专家团的固定提示；
+        - 只写一份 `产品需求说明书.md`，不再生成多张技术工单。
+        """
+
+        def _notify(message: str) -> None:
+            if progress:
+                progress(message)
+
+        if not self.outline_confirmed or self.outline is None:
+            raise LogicError("请先确认大纲，再生成产品说明书")
+
+        _notify("正在把你的需求翻译成小白能看懂的产品说明书...")
+        modules_text = "\n".join(
+            f"- {module.name}：{module.goal}" for module in self.outline.modules
+        )
+        user_content = "\n".join(
+            [
+                "===== 用户原始需求 =====",
+                self.requirement.strip(),
+                "",
+                "===== 已确认的产品模块 =====",
+                modules_text or "无",
+                "",
+                "===== 用户在追问中的补充回答 =====",
+                self._qa_digest() or "无",
+                "",
+                "请输出完整的产品需求说明书三块内容；不要写代码，不要写数据库和 API。",
+            ]
+        )
+
+        body = ""
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                body = llm_client.chat_text(
+                    prompts.PRD_PROMPT,
+                    user_content,
+                    progress=_notify,
+                    system_builder=config.build_prd_system_prompt,
+                )
+                break
+            except llm_client.QuotaExceededError:
+                raise
+            except llm_client.LLMError as exc:
+                last_error = exc
+                print(
+                    f"--- 产品说明书第 {attempt + 1} 次生成失败："
+                    f"{type(exc).__name__}: {str(exc)[:120]} ---"
+                )
+                if attempt == 0:
+                    time.sleep(2)
+        else:
+            print(f"--- 产品说明书生成失败：{type(last_error).__name__ if last_error else 'unknown'} ---")
+            raise LogicError("产品说明书生成失败，请重试") from None
+
+        if len(body.strip()) < 50:
+            raise LogicError("产品说明书内容为空，请重试")
+
+        # 固定追加 WorkBuddy 提示，避免模型漏写
+        prd = body.rstrip() + "\n\n" + config.PRD_WORKBUDDY_HINT + "\n"
+        path = ticket_writer.write_prd(self.project_slug, prd)
+
+        self.generated_ticket_data = [
+            {"filename": path.name, "type": "prd", "content_md": prd}
+        ]
+        self.db_sync_failed = False
+        try:
+            self._ensure_project()
+            project_store.repo.add_ticket(
+                project_id=self.project_id,
+                ticket_type="prd",
+                filename=path.name,
+                content_md=prd,
+            )
+        except Exception as exc:
+            print(
+                f"[pm] 产品说明书入库失败（已转内存兜底）："
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            )
+            self.db_sync_failed = True
+
+        self.phase = config.PHASE_TICKETS
+        try:
+            self._sync_project()
+        except Exception as exc:
+            print(f"[pm] 项目状态同步失败（已标记）：{type(exc).__name__}: {str(exc)[:160]}")
+            self.db_sync_failed = True
+        session_store.save_state(self)
+        _notify("产品说明书已生成")
+        return path
+
     def generate_tickets(self, progress: Callable[[str], None] | None = None) -> list[Path]:
         """第三阶段：逐模块生成 Markdown 工单（断点续跑 + 单张重试）。
 

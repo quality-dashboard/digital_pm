@@ -164,6 +164,19 @@ def write_ticket(
     return target
 
 
+def write_prd(project_slug: str, body_markdown: str) -> Path:
+    """V4.0：写入产品需求说明书（项目根目录，覆盖同名旧版本）。"""
+    body = (body_markdown or "").strip()
+    if len(body) < 50:
+        raise ValueError("产品说明书内容为空，终止写入")
+
+    paths = config.ensure_project_dirs(project_slug)
+    target = paths["project_dir"] / "产品需求说明书.md"
+    _atomic_write(target, body + "\n")
+    append_history(project_slug, {"event": "prd_written", "file": target.name})
+    return target
+
+
 def write_fix_ticket(project_slug: str, body_markdown: str) -> Path:
     """写入 fix_NN.md；标题从正文第一行 `# ...` 提取，缺失则补默认标题。"""
     body = (body_markdown or "").strip()

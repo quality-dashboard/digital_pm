@@ -117,10 +117,12 @@ class Database:
                     "缺少 libsql，请执行：python -m pip install libsql"
                 ) from exc
 
+            # 本地测试优先不卡死：Turso 连接最多等 8 秒，超时立即降级 SQLite；
+            # 网络顺畅时仍会正常使用云端。
             self._conn = libsql.connect(
                 database=config.TURSO_DATABASE_URL,
                 auth_token=config.TURSO_AUTH_TOKEN,
-                timeout=15.0,
+                timeout=8.0,
             )
             return
 

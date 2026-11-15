@@ -92,14 +92,24 @@ def primary_model() -> str:
     return _model_pool()[0]
 
 
-def _post(system_prompt: str, user_content: str, json_mode: bool, model: str) -> str:
-    """用指定模型发送一次 chat/completions 请求，返回助手文本。"""
+def _post(
+    system_prompt: str,
+    user_content: str,
+    json_mode: bool,
+    model: str,
+    system_builder: Callable[[str], str] = config.build_system_prompt,
+) -> str:
+    """用指定模型发送一次 chat/completions 请求，返回助手文本。
+
+    system_builder：System Prompt 构建器。V4 产品说明书传入大白话版本，
+    不再注入技术/代码规则。
+    """
     try:
         import httpx
     except ImportError:
         raise LLMError("AI 服务组件缺失，请联系管理员") from None
 
-    system_text = config.build_system_prompt(system_prompt)
+    system_text = system_builder(system_prompt)
     # 排查用：打印实际请求长度，判断是否接近模型 Token 上限
     print(
         f"[llm] {model} 请求长度：system={len(system_text)} 字符 / "
@@ -190,6 +200,7 @@ def _call(
     user_content: str,
     json_mode: bool,
     progress: ProgressFn | None = None,
+    system_builder: Callable[[str], str] = config.build_system_prompt,
 ) -> str:
     """带多模型 fallback 的统一调用：任一模型失败，sleep(1) 后切下一个。
 
@@ -209,7 +220,13 @@ def _call(
         started = time.monotonic()
 
         try:
-            text = _post(system_prompt, user_content, json_mode, model)
+            text = _post(
+                system_prompt,
+                user_content,
+                json_mode,
+                model,
+                system_builder=system_builder,
+            )
             if index > 1:
                 # 用户需要知道「刚才慢是因为切过模型」，而不是以为一切正常
                 _notify(progress, f"{role} {model} 已恢复响应，继续生成…")
@@ -271,9 +288,16 @@ def chat_text(
     system_prompt: str,
     user_content: str,
     progress: ProgressFn | None = None,
+    system_builder: Callable[[str], str] = config.build_system_prompt,
 ) -> str:
-    """要求模型返回 Markdown 正文（工单 / Fix 工单使用）。"""
-    text = _call(system_prompt, user_content, json_mode=False, progress=progress).strip()
+    """要求模型返回 Markdown 正文（产品说明书 / 旧工单 / Fix 工单使用）。"""
+    text = _call(
+        system_prompt,
+        user_content,
+        json_mode=False,
+        progress=progress,
+        system_builder=system_builder,
+    ).strip()
     if not text:
         print("[llm] 模型返回内容为空（已拦截，不写工单）")
         raise LLMError("AI 返回内容为空，请重试")
