@@ -473,7 +473,9 @@ class PMSession:
                 "===== 用户在追问中的补充回答 =====",
                 self._qa_digest() or "无",
                 "",
-                "请输出完整的产品需求说明书三块内容；不要写代码，不要写数据库和 API。",
+                "请输出完整的产品需求说明书五块内容：功能清单、核心操作流程、"
+                "专属验收清单、外包防坑报价参考、发布与引流建议；"
+                "不要写代码，不要写数据库和 API。",
             ]
         )
 
@@ -504,6 +506,27 @@ class PMSession:
 
         if len(body.strip()) < 50:
             raise LogicError("产品说明书内容为空，请重试")
+
+        # 强制补齐商业板块：模型偶尔漏写，代码兜底保证每份说明书都有
+        extra_sections: list[str] = []
+        if "外包" not in body:
+            extra_sections.append(
+                "## 四、外包防坑报价参考\n"
+                "本产品属于轻量到中等复杂度。若找传统外包公司，报价通常在 "
+                "5000~20000 元，常见加价点是改需求、加页面和后期维护。"
+                "建议不要找全额外包，直接拿着这份说明书去 WorkBuddy 召唤"
+                "【微信小程序开发专家团】自己生成，成本近乎为零。"
+            )
+        if "引流" not in body:
+            extra_sections.append(
+                "## 五、发布与引流建议\n"
+                f"第一波冷启动建议从小红书开始：用「不懂代码的文科生，用 AI 花了 2 小时"
+                f"做了一个{self.outline.project_name}小程序」这类标题，配 3 张使用截图；"
+                "同步发朋友圈和 2~3 个目标用户社群。先把体验用户加到微信，"
+                "建立个人 IP，再考虑会员、定制或广告变现。"
+            )
+        if extra_sections:
+            body = body.rstrip() + "\n\n" + "\n\n".join(extra_sections)
 
         # 固定追加 WorkBuddy 提示，避免模型漏写
         prd = body.rstrip() + "\n\n" + config.PRD_WORKBUDDY_HINT + "\n"
