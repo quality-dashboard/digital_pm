@@ -81,8 +81,7 @@ class Database:
     def __init__(self) -> None:
         # 按配置决定后端：有 Turso URL 用云端，否则本地 SQLite
         self._backend = "turso" if config.TURSO_DATABASE_URL else "sqlite"
-        self._client = None   # libsql_client 同步客户端（纯 Python）
-        self._conn = None     # 本地 sqlite3 连接
+        self._conn = None  # libsql.Connection 或 sqlite3.Connection
         self._lock = threading.RLock()  # 可重入，允许 execute 内部调用 init_schema
         self._schema_ready = False
         # Turso 连不上时自动降级到本地 SQLite，这里记录原因供终端排查
@@ -99,10 +98,11 @@ class Database:
     def _ensure_client(self) -> None:
         """惰性建立连接：没有实际读写前不连接数据库，避免页面启动即失败。
 
-        使用纯 Python 的 libsql-client（国内网络兼容性优先）。
+        使用 libsql 的 HTTP pipeline。实测 libsql-client 的 WebSocket
+        握手会被 Turso 返回 400，因此不再使用旧客户端。
         连接/建表失败会捕获真实异常并降级 SQLite，详细原因打印到终端。
         """
-        if self._client is not None or self._conn is not None:
+        if self._conn is not None:
             return
 
         if self._backend == "turso":
@@ -111,15 +111,16 @@ class Database:
                     "已配置 TURSO_DATABASE_URL，但缺少 TURSO_AUTH_TOKEN，请补全配置"
                 )
             try:
-                import libsql_client
+                import libsql
             except ImportError as exc:
                 raise DatabaseError(
-                    "缺少 libsql-client，请执行：python -m pip install libsql-client"
+                    "缺少 libsql，请执行：python -m pip install libsql"
                 ) from exc
 
-            self._client = libsql_client.create_client_sync(
-                url=config.TURSO_DATABASE_URL,
+            self._conn = libsql.connect(
+                database=config.TURSO_DATABASE_URL,
                 auth_token=config.TURSO_AUTH_TOKEN,
+                timeout=15.0,
             )
             return
 
@@ -140,7 +141,6 @@ class Database:
         """
         self.fallback_reason = f"{type(reason).__name__}: {reason}"[:500]
         self._backend = "sqlite"
-        self._client = None
         self._conn = None
         self._schema_ready = False
         # 按用户要求打印真实异常，便于终端排查；异常中不含 Token
@@ -179,12 +179,8 @@ class Database:
             try:
                 self._ensure_client()
                 for statement in SCHEMA_STATEMENTS:
-                    if self._client is not None:
-                        self._client.execute(statement, [])
-                    else:
-                        self._conn.execute(statement)
-                if self._conn is not None:
-                    self._conn.commit()
+                    self._conn.execute(statement)
+                self._conn.commit()
                 self._schema_ready = True
             except Exception as exc:
                 if self._backend == "turso":
@@ -210,9 +206,6 @@ class Database:
         self.init_schema()
         with self._lock:
             self._ensure_client()
-            if self._client is not None:
-                self._client.execute(sql, list(params))
-                return
             self._conn.execute(sql, tuple(params))
             self._conn.commit()
 
@@ -221,10 +214,6 @@ class Database:
         self.init_schema()
         with self._lock:
             self._ensure_client()
-            if self._client is not None:
-                result = self._client.execute(sql, list(params))
-                columns = list(result.columns)
-                return [dict(zip(columns, row)) for row in result.rows]
             cursor = self._conn.execute(sql, tuple(params))
             rows = cursor.fetchall()
             columns = [item[0] for item in (cursor.description or [])]

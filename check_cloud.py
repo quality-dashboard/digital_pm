@@ -80,10 +80,10 @@ def main() -> None:
     print("URL_SCHEME_OK:", env_url.startswith(("libsql://", "https://")) if env_url else False)
 
     try:
-        import libsql_client
-        print("LIBSQL_CLIENT:", getattr(libsql_client, "__version__", "installed"))
+        import libsql
+        print("LIBSQL:", "installed")
     except Exception as exc:
-        print("LIBSQL_CLIENT: MISSING /", type(exc).__name__)
+        print("LIBSQL: MISSING /", type(exc).__name__)
 
     print("DB_BACKEND(config):", config.DB_BACKEND)
     print("DB_BACKEND(actual):", db.db.backend)
