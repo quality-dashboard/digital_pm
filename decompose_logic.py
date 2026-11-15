@@ -269,22 +269,26 @@ class PMSession:
             lines.extend(f"- {text}" for text in asked)
         return "\n".join(lines)
 
-    def _ask(self) -> Question:
+    def _ask(self, progress: Callable[[str], None] | None = None) -> Question:
         """调用模型生成一个追问。
 
         注意：这里不再因为「模型多问了一个问题」而抛错。
         parse_question 会把多个问句自动收敛为第一个，并标记 auto_trimmed，
         由 UI 轻提示即可，避免产品经理被技术性错误打断。
         """
-        data = llm_client.chat_json(prompts.ASK_PROMPT, self._qa_digest())
+        data = llm_client.chat_json(
+            prompts.ASK_PROMPT,
+            self._qa_digest(),
+            progress=progress,
+        )
         return parse_question(data)
 
-    def start(self) -> Question:
+    def start(self, progress: Callable[[str], None] | None = None) -> Question:
         """开始第一阶段：生成第一个追问；若信息已足够则直接进入大纲阶段。"""
         self.phase = config.PHASE_CLARIFY
         self.round = 0
         self.transcript = []
-        question = self._ask()
+        question = self._ask(progress)
         # 追问生成成功后再建项目，避免千问失败时留下空项目
         self._ensure_project()
         if not question.need_more_info or not question.question.strip():
@@ -298,7 +302,11 @@ class PMSession:
         session_store.save_state(self)  # 追问生成后立即落盘
         return question
 
-    def answer(self, text: str) -> Question | None:
+    def answer(
+        self,
+        text: str,
+        progress: Callable[[str], None] | None = None,
+    ) -> Question | None:
         """记录回答；返回下一个问题，或返回 None 表示信息已足够。
 
         严格遵守「一次一问、必须等回答」：只有调用本方法后才会产生下一轮。
@@ -319,7 +327,7 @@ class PMSession:
             session_store.save_state(self)
             return None
 
-        question = self._ask()
+        question = self._ask(progress)
         if not question.need_more_info or not question.question.strip():
             self.phase = config.PHASE_OUTLINE
             session_store.save_state(self)
@@ -348,14 +356,18 @@ class PMSession:
     # ------------------------------------------------------------------
     # 大纲阶段
     # ------------------------------------------------------------------
-    def build_outline(self) -> Outline:
+    def build_outline(self, progress: Callable[[str], None] | None = None) -> Outline:
         """第二阶段：生成 3~4 个模块的大纲，等待产品经理确认。"""
         if self.pending_question is not None:
             raise LogicError("还有问题未回答，请先提交回答")
         if not self.requirement.strip():
             raise LogicError("需求为空，请先输入需求")
 
-        data = llm_client.chat_json(prompts.OUTLINE_PROMPT, self._qa_digest())
+        data = llm_client.chat_json(
+            prompts.OUTLINE_PROMPT,
+            self._qa_digest(),
+            progress=progress,
+        )
         outline = parse_outline(data)
         self.outline = outline
         # 用户显式填了项目名就优先用用户的，否则用模型建议的名字
@@ -491,6 +503,7 @@ class PMSession:
                 body = llm_client.chat_text(
                     prompts.TICKET_PROMPT,
                     self._ticket_request(module=None, research=True, depends_files=[]),
+                    progress=_notify,
                 )
                 path = ticket_writer.write_ticket(
                     self.project_slug,
@@ -517,6 +530,7 @@ class PMSession:
                 body = llm_client.chat_text(
                     prompts.TICKET_PROMPT,
                     self._ticket_request(module=module, research=False, depends_files=depends_files),
+                    progress=_notify,
                 )
                 path = ticket_writer.write_ticket(
                     self.project_slug,
@@ -551,13 +565,19 @@ class PMSession:
                 pass
 
 
-def generate_fix_ticket(project_slug: str, log_text: str, project_id: str = "") -> Path:
+def generate_fix_ticket(
+    project_slug: str,
+    log_text: str,
+    project_id: str = "",
+    progress: Callable[[str], None] | None = None,
+) -> Path:
     """模块四：根据报错日志 + 项目上下文生成 fix_NN.md。
 
     V3.1.1 变化：
     - 传入 project_id 时，上下文从数据库读取（需求 + 大纲 + 工单文件名），
       不再依赖本地 project.md，适配 Streamlit Cloud 本地磁盘不持久；
     - 生成的 fix 工单同时写入 tickets 表（type=fix），导出 ZIP 能一并带走。
+    V3.3.6 变化：新增 progress 回调，UI 可看到主模型/备用模型的实时切换旁白。
     """
     log_text = (log_text or "").strip()
     if not log_text:
@@ -595,6 +615,7 @@ def generate_fix_ticket(project_slug: str, log_text: str, project_id: str = "") 
     body = llm_client.chat_text(
         prompts.FIX_PROMPT,
         f"{context}\n\n===== 报错原文 =====\n{log_text}",
+        progress=progress,
     )
     path = ticket_writer.write_fix_ticket(project_slug, body)
 

@@ -7,8 +7,10 @@ llm_client.py —— 阿里云百炼（DashScope）调用封装（V3.3.0 多模�
 - chat_text：需要 Markdown 正文（工单、Fix 工单），直接返回文本。
 
 多模型兜底：
-- 模型池按 qwen-plus -> qwen-turbo -> qwen-max 顺序尝试；
-- 任一模型遇到 429/5xx/网络异常，sleep 1 秒后切下一个，避免用户卡死；
+- 模型池按 config.LLM_MODELS 顺序尝试；
+- 任一模型遇到 429/5xx/网络异常/超时，sleep 1 秒后切下一个，避免用户卡死；
+- 每次「尝试模型 / 超时切换」都通过 progress 回调同步播报给 UI（st.status），
+  页面不会长时间只有转圈没有文字；
 - 全部失败只返回固定中文提示，页面不暴露底层异常与路径。
 
 安全约定：
@@ -20,17 +22,20 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Callable
 
 import config
 
-# 模型池：Plus 性价比最高；失败后切 Turbo；最后 Max 兜底。
+# 模型池：按 config.LLM_MODELS 顺序兜底。
 # 如果环境变量 DASHSCOPE_MODEL 显式配置了其他模型，会放在池子最前面。
 # 欠费保护：模型池统一由 config.LLM_MODELS 管理，只保留最基础的经典模型。
-# 不再包含 qwen3.8/glm/kimi 等变种或第三方模型，避免产生额外费用。
 MODELS: tuple[str, ...] = config.LLM_MODELS
 
 # 页面统一展示的友好提示：不包含 HTTP 状态码、路径、堆栈
 FRIENDLY_ERROR = "AI 服务当前繁忙，请稍后重试"
+
+# 进度旁白回调：由 UI 传入（例如更新 st.status），LLM 层只负责同步喊话
+ProgressFn = Callable[[str], None]
 
 
 class LLMError(RuntimeError):
@@ -43,6 +48,21 @@ class MissingAPIKeyError(LLMError):
 
 class QuotaExceededError(LLMError):
     """402/403：欠费或额度耗尽，必须立即停止请求，避免继续产生费用。"""
+
+
+class LLMTimeoutError(LLMError):
+    """单次请求超时：单独成类，旁白才能明确说「超时」而不是笼统的失败。"""
+
+
+def _notify(progress: ProgressFn | None, message: str) -> None:
+    """安全触发进度旁白：UI 回调出错绝不能中断已经发出的大模型请求。"""
+    if not progress:
+        return
+    try:
+        progress(message)
+    except Exception as exc:
+        # 只记类型，不打印内容，避免页面已断开时日志刷屏
+        print(f"[llm] 进度回调异常（已忽略）：{type(exc).__name__}")
 
 
 def get_api_key() -> str:
@@ -100,12 +120,19 @@ def _post(system_prompt: str, user_content: str, json_mode: bool, model: str) ->
     }
 
     try:
-        with httpx.Client(timeout=config.LLM_TIMEOUT) as client:
+        # 建连超时单独收紧（默认 10s）：网络不通时快速失败并切备用模型，
+        # 读超时仍用 LLM_TIMEOUT（默认 90s），给正常长文本生成留足时间。
+        timeout = httpx.Timeout(config.LLM_TIMEOUT, connect=config.LLM_CONNECT_TIMEOUT)
+        with httpx.Client(timeout=timeout) as client:
             response = client.post(url, headers=headers, json=payload)
             # 兼容不支持 response_format 的网关：400 时去掉该参数重试一次
             if response.status_code == 400 and json_mode:
                 payload.pop("response_format", None)
                 response = client.post(url, headers=headers, json=payload)
+    except httpx.TimeoutException:
+        # 超时单独抛出：上层据此播报「主模型超时，正在切换备用模型」
+        print(f"[llm] {model} 响应超时（>{config.LLM_TIMEOUT:.0f}s）")
+        raise LLMTimeoutError("模型响应超时") from None
     except Exception as exc:
         # 内部细节只写服务端日志，不进入页面
         print(f"[llm] {model} 网络异常：{type(exc).__name__}: {str(exc)[:160]}")
@@ -127,22 +154,52 @@ def _post(system_prompt: str, user_content: str, json_mode: bool, model: str) ->
         raise LLMError("AI 返回结构异常") from None
 
 
-def _call(system_prompt: str, user_content: str, json_mode: bool) -> str:
-    """带多模型 fallback 的统一调用：任一模型失败，sleep(1) 后切下一个。"""
+def _call(
+    system_prompt: str,
+    user_content: str,
+    json_mode: bool,
+    progress: ProgressFn | None = None,
+) -> str:
+    """带多模型 fallback 的统一调用：任一模型失败，sleep(1) 后切下一个。
+
+    progress：进度旁白回调。每次尝试前、超时切换时都会同步喊话，
+    UI 用 st.status 接住即可看到「正在试主模型 → 超时 → 切备用模型」全过程。
+    """
     if not is_configured():
         raise MissingAPIKeyError("未配置 AI 密钥，请联系管理员")
 
+    models = _model_pool()
+    total = len(models)
     last_error: Exception | None = None
-    for model in _model_pool():
+
+    for index, model in enumerate(models, start=1):
+        role = "主模型" if index == 1 else f"备用模型 {index - 1}"
+        _notify(progress, f"正在尝试{role} {model}（{index}/{total}）…")
+        started = time.monotonic()
+
         try:
-            return _post(system_prompt, user_content, json_mode, model)
+            text = _post(system_prompt, user_content, json_mode, model)
+            if index > 1:
+                # 用户需要知道「刚才慢是因为切过模型」，而不是以为一切正常
+                _notify(progress, f"{role} {model} 已恢复响应，继续生成…")
+            return text
         except QuotaExceededError:
             # 欠费/额度耗尽：立即停止，不再尝试其他模型，避免继续请求
             raise
         except LLMError as exc:
             last_error = exc
-            print(f"[llm] {model} 失败，切换下一个模型：{str(exc)[:120]}")
-            time.sleep(1)  # 按产品经理要求：失败后等待 1 秒再切
+            waited = time.monotonic() - started
+            reason = "响应超时" if isinstance(exc, LLMTimeoutError) else "暂时不可用"
+            print(f"[llm] {model} 失败（{waited:.0f}s，{reason}）：{str(exc)[:120]}")
+            if index < total:
+                _notify(
+                    progress,
+                    f"{role} {model} {reason}（已等待 {waited:.0f} 秒），"
+                    f"正在切换备用模型 {models[index]}…请稍候",
+                )
+                time.sleep(1)  # 按产品经理要求：失败后等待 1 秒再切
+            else:
+                _notify(progress, "所有模型均未响应，正在整理提示…")
 
     # 所有模型都失败：只给固定提示，绝不把底层异常/路径抛给页面
     print(f"[llm] 模型池全部失败：{type(last_error).__name__ if last_error else 'unknown'}")
@@ -169,15 +226,23 @@ def _extract_json(text: str) -> dict:
     return data
 
 
-def chat_json(system_prompt: str, user_content: str) -> dict:
+def chat_json(
+    system_prompt: str,
+    user_content: str,
+    progress: ProgressFn | None = None,
+) -> dict:
     """要求模型返回 JSON 对象（追问 / 大纲阶段使用）。"""
-    text = _call(system_prompt, user_content, json_mode=True)
+    text = _call(system_prompt, user_content, json_mode=True, progress=progress)
     return _extract_json(text)
 
 
-def chat_text(system_prompt: str, user_content: str) -> str:
+def chat_text(
+    system_prompt: str,
+    user_content: str,
+    progress: ProgressFn | None = None,
+) -> str:
     """要求模型返回 Markdown 正文（工单 / Fix 工单使用）。"""
-    text = _call(system_prompt, user_content, json_mode=False).strip()
+    text = _call(system_prompt, user_content, json_mode=False, progress=progress).strip()
     if not text:
         raise LLMError("AI 返回内容为空，请重试")
     if len(text) > config.MAX_TICKET_CHARS:
