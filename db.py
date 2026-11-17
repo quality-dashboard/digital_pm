@@ -184,10 +184,13 @@ class Database:
             for attempt in range(2):
                 try:
                     self._ensure_client()
+                    if self._conn is None:
+                        raise DatabaseError("数据库连接不可用")
                     for statement in SCHEMA_STATEMENTS:
                         self._conn.execute(statement)
                     self._conn.commit()
                     self._schema_ready = True
+                    last_error = None
                     break
                 except Exception as exc:
                     last_error = exc
@@ -202,6 +205,7 @@ class Database:
                     except Exception:
                         pass
                     self._conn = None
+                    self._schema_ready = False
                     if attempt == 0 and self._backend == "turso":
                         time.sleep(2)
                         continue
@@ -209,16 +213,17 @@ class Database:
                         # 两次都失败：降级 SQLite，保证页面其他功能继续可用
                         self._fallback_to_sqlite(exc)
                         self._ensure_client()
+                        if self._conn is None:
+                            raise DatabaseError("本地数据库初始化失败") from None
                         for statement in SCHEMA_STATEMENTS:
                             self._conn.execute(statement)
                         self._conn.commit()
                         self._schema_ready = True
-                        self._cleanup_expired()
-                        return
+                        last_error = None
+                        break
                     raise
-            else:
-                if last_error is not None:
-                    raise last_error
+            if last_error is not None:
+                raise last_error
 
         # 建表成功后执行一次 30 天清理（每次进程首次连接执行一次）
         self._cleanup_expired()
@@ -231,6 +236,8 @@ class Database:
         self.init_schema()
         with self._lock:
             self._ensure_client()
+            if self._conn is None:
+                raise DatabaseError("数据库连接不可用")
             self._conn.execute(sql, tuple(params))
             self._conn.commit()
 
@@ -239,6 +246,8 @@ class Database:
         self.init_schema()
         with self._lock:
             self._ensure_client()
+            if self._conn is None:
+                raise DatabaseError("数据库连接不可用")
             cursor = self._conn.execute(sql, tuple(params))
             rows = cursor.fetchall()
             columns = [item[0] for item in (cursor.description or [])]
@@ -256,8 +265,15 @@ class Database:
         - 达到上限时不写入，直接返回 False。
         """
         today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-        self.init_schema()
-        rows = self.query("SELECT count FROM quota_daily WHERE date = ?", (today,))
+        try:
+            self.init_schema()
+            rows = self.query("SELECT count FROM quota_daily WHERE date = ?", (today,))
+        except Exception as exc:
+            # 线上旧数据库可能缺少 quota_daily 表：强制重建 schema 后重试
+            print(f"[db] 配额表不可用，尝试重建 schema：{type(exc).__name__}")
+            self._schema_ready = False
+            self.init_schema()
+            rows = self.query("SELECT count FROM quota_daily WHERE date = ?", (today,))
         used = int(rows[0]["count"]) if rows else 0
         if used >= limit:
             return False, used

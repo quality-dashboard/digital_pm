@@ -193,9 +193,18 @@ try:
     def _quota_guard() -> None:
         """全局每日配额：超过 100 次直接拦截，保护 API 额度。
 
-        配额按北京时间切分；只有真正要调用大模型时才消耗次数。
+        配额按北京时间切分；数据库/配额表暂时不可用时跳过计数，
+        避免用户在聊天入口被底层异常卡死。
         """
-        allowed, _used = db.db.consume_quota(limit=100)
+        try:
+            allowed, _used = db.db.consume_quota(limit=100)
+        except Exception as exc:
+            print(
+                f"[ui] 配额检查失败（已跳过计数）："
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            )
+            st.warning("配额服务暂时不可用，本次请求已放行，请稍后重试。")
+            return
         if not allowed:
             st.error("今日免费体验名额已满，请明天再来～")
             st.stop()
