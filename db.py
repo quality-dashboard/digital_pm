@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import config
@@ -172,30 +173,52 @@ class Database:
             print(f"[db] 过期数据清理失败：{type(exc).__name__}")
 
     def init_schema(self) -> None:
-        """幂等建表；Turso 失败时自动降级到本地 SQLite 并继续建表。"""
+        """幂等建表；Turso 失败时自动重试，仍失败则降级本地 SQLite。"""
         if self._schema_ready:
             return
         with self._lock:
             if self._schema_ready:
                 return
-            try:
-                self._ensure_client()
-                for statement in SCHEMA_STATEMENTS:
-                    self._conn.execute(statement)
-                self._conn.commit()
-                self._schema_ready = True
-            except Exception as exc:
-                if self._backend == "turso":
-                    # 用户要求：云端连不上先降级，让页面能跑，再排查配置
-                    self._fallback_to_sqlite(exc)
+            last_error: Exception | None = None
+            # 电脑端网络异常时给 2 次机会（单次连接超时 8 秒 + 间隔 2 秒）
+            for attempt in range(2):
+                try:
                     self._ensure_client()
                     for statement in SCHEMA_STATEMENTS:
                         self._conn.execute(statement)
                     self._conn.commit()
                     self._schema_ready = True
-                    self._cleanup_expired()
-                    return
-                raise
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    print(
+                        f"[db] Turso 连接/建表失败（第 {attempt + 1}/2 次）："
+                        f"{type(exc).__name__}: {str(exc)[:200]}"
+                    )
+                    # 丢弃旧连接，下一次尝试重新建连
+                    try:
+                        if self._conn is not None and self._backend == "turso":
+                            self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+                    if attempt == 0 and self._backend == "turso":
+                        time.sleep(2)
+                        continue
+                    if self._backend == "turso":
+                        # 两次都失败：降级 SQLite，保证页面其他功能继续可用
+                        self._fallback_to_sqlite(exc)
+                        self._ensure_client()
+                        for statement in SCHEMA_STATEMENTS:
+                            self._conn.execute(statement)
+                        self._conn.commit()
+                        self._schema_ready = True
+                        self._cleanup_expired()
+                        return
+                    raise
+            else:
+                if last_error is not None:
+                    raise last_error
 
         # 建表成功后执行一次 30 天清理（每次进程首次连接执行一次）
         self._cleanup_expired()

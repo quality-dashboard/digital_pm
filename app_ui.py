@@ -101,18 +101,16 @@ try:
         st.info("正在生成中，请稍候……")
         st.stop()
 
-    # 初始化数据库：Turso 连不上会自动降级到本地 SQLite，先保证页面可用
+    # 初始化数据库：Turso 连不上会自动重试并降级到本地 SQLite，先保证页面可用
     try:
         db.db.init_schema()
     except Exception:
-        # 固定文案：不显示路径、异常类型或堆栈
-        st.error("数据库初始化失败，请联系管理员或稍后重试。")
-        st.stop()
+        # 不阻断页面：本地存储也失败时，仍允许进入页面并尝试其他功能
+        st.warning("本地存储初始化失败，部分功能暂时不可用，请刷新重试。")
 
     if db.db.fallback_reason:
         st.warning(
-            "⚠️ 云端数据库连接失败，系统已自动切换至本地离线模式，"
-            "您的数据将保存在本地浏览器，不影响使用。"
+            "⚠️ 您的网络环境可能屏蔽了云数据库，已自动为您切换本地模式"
         )
 
 
@@ -124,6 +122,19 @@ try:
     def _store(session: decompose_logic.PMSession) -> None:
         """写回对话状态。"""
         st.session_state["pm_session"] = session
+
+    def _reset_project_state() -> None:
+        """强制回到新建项目：清空当前会话与下载缓存，保留访客 session_id。"""
+        for key in (
+            "pm_session",
+            "restored_from",
+            "tickets",
+            "tickets_project_id",
+            "chat_error",
+            "new_project_mode",
+        ):
+            st.session_state.pop(key, None)
+        st.session_state["requirement_input"] = ""
 
 
     # 只有业务层精心构造的中文提示可以直接展示；
@@ -252,6 +263,9 @@ try:
         if chat_error:
             st.error(chat_error)
 
+        if st.session_state.get("new_project_mode"):
+            st.info("已进入新建项目，请在下方输入你的产品想法。")
+
         session = _session()
         # 状态自检：追问阶段却没有待回答问题，说明状态卡死，重置为初始输入
         if (
@@ -344,6 +358,7 @@ try:
         content = (text or "").strip()
         if not content:
             return
+        is_new = session is None
         if session is not None and session.pending_question is None:
             # 追问已完成/被跳过：不再把新消息当回答，避免 LogicError
             st.info(
@@ -376,6 +391,7 @@ try:
                 else:
                     session.answer(content, progress=_status_progress(status))
                 _store(session)
+                st.session_state.pop("new_project_mode", None)
                 ok = True
                 status.update(label="思考完成", state="complete", expanded=False)
             except Exception as exc:
@@ -384,6 +400,8 @@ try:
                 status.update(label="处理失败", state="error")
                 if isinstance(exc, llm_client.QuotaExceededError):
                     friendly = "系统今日额度已用尽"
+                elif is_new and not isinstance(exc, llm_client.LLMError):
+                    friendly = "网络异常，项目创建失败，请检查网络"
                 else:
                     friendly = "AI大脑开小差了，请重新输入刚才的需求试试。"
                 st.session_state["chat_error"] = friendly
@@ -394,13 +412,13 @@ try:
             st.rerun()
 
 
-    # 首次加载：恢复最近项目（不按 session_id 过滤，刷新/换浏览器后不丢失历史任务）
-    if "pm_session" not in st.session_state:
+    # 首次加载：恢复最近项目；新建模式下不恢复，避免把用户拉回旧项目
+    if "pm_session" not in st.session_state and not st.session_state.get("new_project_mode"):
         try:
             _recent_projects = project_store.repo.list_projects(limit=1)
         except Exception:
-            st.error("数据库连接失败，请联系管理员或稍后重试。")
-            st.stop()
+            st.warning("项目恢复失败，您仍可新建项目。")
+            _recent_projects = []
 
         if _recent_projects:
             _restored = decompose_logic.PMSession.from_db_project(_recent_projects[0])
@@ -439,16 +457,25 @@ try:
 
         st.divider()
         st.subheader("项目")
+        if st.button("➕ 新建项目", use_container_width=True, key="new_project_btn"):
+            _reset_project_state()
+            st.session_state["new_project_mode"] = True
+            st.rerun()
+
         try:
             # 全局项目列表：访问码是唯一门禁，不再按浏览器会话隔离，
             # 否则关闭标签页 / 换浏览器后旧任务会“消失”。
             _projects = project_store.repo.list_projects(limit=50)
         except Exception:
-            st.error("读取项目列表失败，请稍后重试。")
-            st.stop()
+            st.warning("项目列表暂时不可用，您仍可新建项目。")
+            _projects = []
 
-        # 最近项目放最前并默认选中，“（新建项目）”放最后
-        _options = [item["id"] for item in _projects] + ["（新建项目）"]
+        # 新建模式下“（新建项目）”置顶；否则历史项目在前
+        _project_ids = [item["id"] for item in _projects]
+        if st.session_state.get("new_project_mode"):
+            _options = ["（新建项目）"] + _project_ids
+        else:
+            _options = _project_ids + ["（新建项目）"]
         _labels = {
             item["id"]: f"{item['name']}（{_PHASE_LABELS.get(item['phase'], item['phase'])}）"
             for item in _projects
@@ -460,6 +487,14 @@ try:
             index=0,
             format_func=lambda pid: _labels.get(pid, pid),
         )
+
+        if selected_project_id == "（新建项目）":
+            if not st.session_state.get("new_project_mode"):
+                _reset_project_state()
+                st.session_state["new_project_mode"] = True
+                st.rerun()
+        else:
+            st.session_state.pop("new_project_mode", None)
         st.caption("已显示全部历史项目；刷新或换浏览器后不会再丢失。")
 
         if selected_project_id != "（新建项目）":
