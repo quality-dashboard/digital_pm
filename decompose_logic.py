@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -35,6 +36,22 @@ class LogicError(RuntimeError):
     """阶段顺序不合法、缺少前置条件时抛出，UI 直接展示给产品经理。"""
 
 
+# 澄清阶段必须收集的四个字段：三个具体角色 + 交付形态
+ROLE_LABELS: dict[str, str] = {
+    "usage": "使用角色",
+    "approval": "审批角色",
+    "viewer": "数据查看角色",
+}
+DELIVERY_FORMS: tuple[str, ...] = (
+    "网页链接",
+    "单文件 HTML",
+    "微信小程序",
+    "桌面软件",
+    "Excel 工具",
+    "纯文档",
+)
+
+
 @dataclass
 class PMSession:
     """一次项目对话的全部状态；由 Streamlit session_state 持有。"""
@@ -51,6 +68,10 @@ class PMSession:
     outline: Outline | None = None
     outline_confirmed: bool = False
     generated_tickets: list[str] = field(default_factory=list)
+    # V4.2：澄清必答项（角色与交付形态），不允许默认成“老板/小程序”
+    roles: dict[str, str] = field(default_factory=dict)
+    delivery_form: str = ""
+    required_pending: bool = False
     # V3.3.1：内存兜底数据（数据库暂存失败时用于生成 ZIP），不写入 JSON 快照
     generated_ticket_data: list[dict] = field(default_factory=list)
     db_sync_failed: bool = False
@@ -73,6 +94,9 @@ class PMSession:
             "outline": asdict(self.outline) if self.outline else None,
             "outline_confirmed": self.outline_confirmed,
             "generated_tickets": self.generated_tickets,
+            "roles": self.roles,
+            "delivery_form": self.delivery_form,
+            "required_pending": self.required_pending,
         }
 
     @classmethod
@@ -129,6 +153,16 @@ class PMSession:
             if isinstance(item, dict)
         ]
 
+        # 角色与交付形态：旧快照没有这些字段时保持为空，由页面重新追问
+        roles_raw = data.get("roles")
+        roles: dict[str, str] = {}
+        if isinstance(roles_raw, dict):
+            roles = {
+                str(key): str(value).strip()
+                for key, value in roles_raw.items()
+                if str(value).strip()
+            }
+
         # 轮次容错：坏值不影响恢复
         try:
             round_no = int(data.get("round", 0) or 0)
@@ -148,6 +182,9 @@ class PMSession:
             outline=outline,
             outline_confirmed=bool(data.get("outline_confirmed", False)),
             generated_tickets=[str(item) for item in data.get("generated_tickets", [])],
+            roles=roles,
+            delivery_form=str(data.get("delivery_form", "")).strip(),
+            required_pending=bool(data.get("required_pending", False)),
         )
 
     # ------------------------------------------------------------------
@@ -267,7 +304,151 @@ class PMSession:
         if asked:
             lines.extend(["", "已经问过的问题（不要重复）："])
             lines.extend(f"- {text}" for text in asked)
+        if self.roles or self.delivery_form:
+            lines.extend(["", "已确认的角色与交付形态（后续必须使用这些角色名）："])
+            for key, label in ROLE_LABELS.items():
+                if self.roles.get(key):
+                    lines.append(f"- {label}：{self.roles[key]}")
+            if self.delivery_form:
+                lines.append(f"- 交付形态：{self.delivery_form}")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # V4.2 澄清必答项：角色 + 交付形态
+    # ------------------------------------------------------------------
+    def missing_required_fields(self) -> list[str]:
+        """返回尚未确认的必答项，空列表表示已齐。"""
+        missing = [
+            label
+            for key, label in ROLE_LABELS.items()
+            if not str(self.roles.get(key, "")).strip()
+        ]
+        if not str(self.delivery_form or "").strip():
+            missing.append("交付形态")
+        return missing
+
+    def required_question_text(self) -> str:
+        """固定必答问题：一次收集三个角色 + 交付形态，不额外增加一轮。"""
+        return (
+            "开始前请一次性告诉我 4 件事（每行一项，照格式写）：\n"
+            "使用角色：___\n"
+            "审批角色：___\n"
+            "数据查看角色：___\n"
+            "交付形态（网页链接 / 单文件 HTML / 微信小程序 / 桌面软件 / Excel 工具 / 纯文档）：___"
+        )
+
+    def _normalize_delivery(self, value: str) -> str:
+        """把用户口语化的交付形态收敛成标准选项。"""
+        text = str(value or "").strip()
+        lower = text.lower()
+        if "单文件" in text or "html" in lower:
+            return "单文件 HTML"
+        if "小程序" in text:
+            return "微信小程序"
+        if "桌面" in text or "exe" in lower or "客户端" in text:
+            return "桌面软件"
+        if "excel" in lower or "表格" in text:
+            return "Excel 工具"
+        if "文档" in text or "word" in lower:
+            return "纯文档"
+        if "网页" in text or "链接" in text or "网站" in text:
+            return "网页链接"
+        return text
+
+    def _parse_required_fields(self, text: str) -> None:
+        """解析“使用角色：X；审批角色：Y”这类回答；解析不出就保持缺失。"""
+        mapping = {
+            "使用角色": "usage",
+            "审批角色": "approval",
+            "数据查看角色": "viewer",
+            "交付形态": "delivery",
+        }
+        chunks = re.split(r"[；;，,\n]", text or "")
+        for chunk in chunks:
+            item = chunk.strip().lstrip("-* ").strip()
+            for label, field in mapping.items():
+                for sep in ("：", ":"):
+                    prefix = label + sep
+                    if not item.startswith(prefix):
+                        continue
+                    value = item[len(prefix):].strip()
+                    if not value:
+                        continue
+                    if field == "delivery":
+                        self.delivery_form = self._normalize_delivery(value)
+                    else:
+                        self.roles[field] = value
+                    break
+
+    def _answer_required(
+        self,
+        text: str,
+        progress: Callable[[str], None] | None = None,
+    ) -> Question | None:
+        """处理必答项回答；缺项时继续问同一组问题，不默认成老板/小程序。"""
+        self.required_pending = True
+        self.transcript.append({"role": "pm", "content": text})
+        self._parse_required_fields(text)
+        missing = self.missing_required_fields()
+
+        if missing:
+            self.pending_question = Question(
+                need_more_info=True,
+                question=self.required_question_text(),
+                reason=f"还缺：{'、'.join(missing)}；这四项不能默认。",
+                options=[],
+            )
+            self.transcript.append(
+                {"role": "assistant", "content": self.pending_question.question}
+            )
+            session_store.save_state(self)
+            return self.pending_question
+
+        self.required_pending = False
+        self.pending_question = None
+
+        # 从历史项目恢复、已经确认过大纲的场景：补齐后直接回原阶段，不再追问
+        if self.phase != config.PHASE_CLARIFY:
+            session_store.save_state(self)
+            return None
+
+        self.round = max(self.round, 1)
+        if self.round >= config.MAX_CLARIFY_ROUNDS:
+            self.phase = config.PHASE_OUTLINE
+            session_store.save_state(self)
+            return None
+
+        try:
+            question = self._ask(progress)
+        except Exception as exc:
+            # AI 暂时不可用：保留已收集的角色，给一个可回答的兜底问题，避免状态机清空
+            print(f"[pm] 必答项补齐后追问失败：{type(exc).__name__}: {str(exc)[:120]}")
+            self.pending_question = Question(
+                need_more_info=True,
+                question="请再补充一下：这个产品最核心的一个使用场景是什么？",
+                reason="AI 暂时没有响应，先继续收集关键信息。",
+                options=[],
+            )
+            self.transcript.append(
+                {"role": "assistant", "content": self.pending_question.question}
+            )
+            session_store.save_state(self)
+            return self.pending_question
+
+        if not question.need_more_info or not question.question.strip():
+            self.phase = config.PHASE_OUTLINE
+            session_store.save_state(self)
+            return None
+        self.pending_question = question
+        self.transcript.append({"role": "assistant", "content": question.question})
+        session_store.save_state(self)
+        return question
+
+    def _ensure_required_fields(self) -> None:
+        """生成大纲/说明书前的硬门禁：角色和交付形态必须明确。"""
+        missing = self.missing_required_fields()
+        if missing:
+            raise LogicError("请先补充：" + "、".join(missing))
 
     def _ask(self, progress: Callable[[str], None] | None = None) -> Question:
         """调用模型生成一个追问。
@@ -284,10 +465,26 @@ class PMSession:
         return parse_question(data)
 
     def start(self, progress: Callable[[str], None] | None = None) -> Question:
-        """开始第一阶段：生成第一个追问；若信息已足够则直接进入大纲阶段。"""
+        """开始第一阶段：先收集必答项，再生成第一个追问。"""
         self.phase = config.PHASE_CLARIFY
         self.round = 0
         self.transcript = []
+
+        if self.missing_required_fields():
+            self.required_pending = True
+            question = Question(
+                need_more_info=True,
+                question=self.required_question_text(),
+                reason="这四项决定说明书里的角色名、交付方式和风险判断，不能默认。",
+                options=[],
+            )
+            self._ensure_project()
+            self.pending_question = question
+            self.transcript.append({"role": "assistant", "content": question.question})
+            session_store.save_state(self)
+            return question
+
+        self.required_pending = False
         question = self._ask(progress)
         # 追问生成成功后再建项目，避免千问失败时留下空项目
         self._ensure_project()
@@ -314,6 +511,8 @@ class PMSession:
         text = (text or "").strip()
         if not text:
             raise LogicError("回答不能为空")
+        if self.required_pending or self.missing_required_fields():
+            return self._answer_required(text, progress)
         if self.pending_question is None:
             raise LogicError("当前没有待回答的问题")
 
@@ -362,6 +561,20 @@ class PMSession:
         """
         if self.phase != config.PHASE_CLARIFY:
             return
+        if self.missing_required_fields():
+            # 角色/交付形态没收集齐时不允许跳过，否则只能默认成老板/小程序
+            self.required_pending = True
+            self.pending_question = Question(
+                need_more_info=True,
+                question=self.required_question_text(),
+                reason="请先补齐角色和交付形态，不能跳过。",
+                options=[],
+            )
+            self.transcript.append(
+                {"role": "assistant", "content": "请先补齐角色和交付形态，再跳过追问。"}
+            )
+            session_store.save_state(self)
+            return
         self.pending_question = None
         self.phase = config.PHASE_OUTLINE
         self.transcript.append(
@@ -376,6 +589,7 @@ class PMSession:
         """第二阶段：生成 3~4 个模块的大纲，等待产品经理确认。"""
         if self.pending_question is not None:
             raise LogicError("还有问题未回答，请先提交回答")
+        self._ensure_required_fields()
         if not self.requirement.strip():
             raise LogicError("需求为空，请先输入需求")
 
@@ -400,6 +614,7 @@ class PMSession:
         """产品经理点击「确认大纲无误」：写 project.md 并解锁工单生成。"""
         if self.outline is None:
             raise LogicError("还没有生成大纲")
+        self._ensure_required_fields()
         self.outline_confirmed = True
         self.phase = config.PHASE_CONFIRMED
         meta_path = ticket_writer.write_project_meta(
@@ -473,15 +688,28 @@ class PMSession:
 
         if not self.outline_confirmed or self.outline is None:
             raise LogicError("请先确认大纲，再生成产品说明书")
+        self._ensure_required_fields()
 
         _notify("正在把你的需求翻译成小白能看懂的产品说明书...")
         modules_text = "\n".join(
             f"- {module.name}：{module.goal}" for module in self.outline.modules
         )
+        usage = self.roles.get("usage", "使用角色")
+        approval = self.roles.get("approval", "审批角色")
+        viewer = self.roles.get("viewer", "数据查看角色")
+        delivery = self.delivery_form or "未指定"
         user_content = "\n".join(
             [
                 "===== 用户原始需求 =====",
                 self.requirement.strip(),
+                "",
+                "===== 已确认角色（全文必须使用这些具体名称）=====",
+                f"- 使用角色：{usage}",
+                f"- 审批角色：{approval}",
+                f"- 数据查看角色：{viewer}",
+                "",
+                "===== 交付形态（不得假设成小程序）=====",
+                f"- 本产品交付形态为：{delivery}",
                 "",
                 "===== 已确认的产品模块 =====",
                 modules_text or "无",
@@ -489,8 +717,9 @@ class PMSession:
                 "===== 用户在追问中的补充回答 =====",
                 self._qa_digest() or "无",
                 "",
-                "请输出完整的产品需求说明书五块内容：功能清单、核心操作流程、"
-                "专属验收清单、外包防坑报价参考、发布与引流建议；"
+                "请输出完整产品说明书，必须包含：基础假设、交付形态说明、"
+                "产品功能清单（每条带来源标签）、核心操作流程（只用具体角色名）、"
+                "验收清单、冲突处理、实现风险清单、外包报价、发布引流、本次推断清单。"
                 "不要写代码，不要写数据库和 API。",
             ]
         )
@@ -523,26 +752,166 @@ class PMSession:
         if len(body.strip()) < 50:
             raise LogicError("产品说明书内容为空，请重试")
 
-        # 强制补齐商业板块：模型偶尔漏写，代码兜底保证每份说明书都有
+        usage = self.roles.get("usage", "使用角色")
+        approval = self.roles.get("approval", "审批角色")
+        viewer = self.roles.get("viewer", "数据查看角色")
+        delivery = self.delivery_form or "未指定"
+
+        # 1) 清除模板污染：老板/管理员/用户 一律替换成具体角色
+        body = (
+            body.replace("老板", approval)
+            .replace("管理员", viewer)
+            .replace("用户", usage)
+        )
+        # 交付形态不是小程序时，清掉模型残留的“小程序”假设
+        if delivery != "微信小程序":
+            body = body.replace("微信小程序", delivery).replace("小程序", delivery)
+
+        # 2) 基础假设：代码强制注入，保证四类假设逐条可确认
+        if delivery == "微信小程序":
+            storage = "微信云数据库"
+            deploy = "微信开发者工具提交审核，审核周期约 1~7 天，需要小程序主体认证"
+        elif delivery == "单文件 HTML":
+            storage = "浏览器本地存储，容量有限，清理缓存可能丢失"
+            deploy = "直接发送 HTML 文件或用静态托管链接分享，不依赖服务器"
+        elif delivery == "网页链接":
+            storage = "云端数据库"
+            deploy = "部署到云服务器或静态托管，生成可访问链接"
+        elif delivery == "Excel 工具":
+            storage = "本地 Excel 文件"
+            deploy = "发送 Excel 文件，需要说明 Office 版本与宏支持"
+        elif delivery == "桌面软件":
+            storage = "本地数据库或本地文件"
+            deploy = "提供安装包，需要说明 Windows/macOS 兼容性"
+        else:
+            storage = "本地文件或浏览器存储"
+            deploy = "按实际交付方式说明"
+
+        base_bullets = (
+            f"- 交付形态：我推断为{delivery}，如不对请指出\n"
+            f"- 使用角色：我推断为{usage}，如不对请指出\n"
+            f"- 审批角色：我推断为{approval}，如不对请指出\n"
+            f"- 数据查看角色：我推断为{viewer}，如不对请指出\n"
+            f"- 数据存放位置：我推断为{storage}，如不对请指出\n"
+            f"- 上线/分发方式：我推断为{deploy}，如不对请指出\n"
+            f"- 本产品交付形态为{delivery}，原因是你在澄清阶段确认了它；如果不对请指出\n"
+        )
+        if "基础假设" not in body:
+            body = (
+                "## 〇、基础假设（请逐条确认）\n" + base_bullets + "\n" + body
+            )
+        else:
+            # 模型可能只写了一段话而不是可勾选列表，代码补一份标准确认清单
+            body = (
+                "### 基础假设补充（请逐条确认）\n" + base_bullets + "\n" + body
+            )
+        if "本产品交付形态为" not in body:
+            body = (
+                f"## 交付形态\n本产品交付形态为{delivery}，原因是你选择/确认了它。\n\n"
+            ) + body
+
+        # 3) 每条功能/流程补来源标签（模型漏标时保守标为推断）
+        lines = body.splitlines()
+        in_labeled_section = False
+        for index, line in enumerate(lines):
+            if "产品功能清单" in line or "核心操作流程" in line:
+                in_labeled_section = True
+                continue
+            if in_labeled_section and line.startswith("## "):
+                in_labeled_section = False
+            if (
+                in_labeled_section
+                and line.strip().startswith("- ")
+                and not any(tag in line for tag in ("【你说的】", "【我推断的】", "【行业惯例】"))
+            ):
+                lines[index] = line.rstrip() + "【我推断的】"
+        body = "\n".join(lines)
+
+        # 4) 冲突处理：禁止“按确定方案执行”，缺失时给标准选项
+        body = body.replace(
+            "按确定方案执行",
+            "按推荐方案执行，已放弃另一方案的能力，你可以要求改回",
+        )
+        if "方案一" not in body:
+            body += (
+                "\n\n## 四、冲突处理\n"
+                "冲突点：需求中存在互相制约的目标（例如纯离线可用 vs 在线识别/在线图表）。\n"
+                "方案一：优先保证离线可用，放弃部分在线能力。\n"
+                "方案二：优先在线能力，接受断网/弱网不可用。\n"
+                "我的推荐：方案一，理由是目标场景网络不稳定。\n"
+                "请确认选哪个。\n"
+                "此处我按方案一执行，已放弃方案二的在线能力，你可以要求改回。"
+            )
+        elif "请确认" not in body:
+            body += "\n\n请确认选哪个。"
+
+        # 5) 实现风险清单：代码兜底，覆盖四类必查风险
+        risk_body = (
+            "| 功能点 | 实现难度 | 具体风险 | 替代方案 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| 纯离线图表 | 高 | 断网时图表库/字体加载失败 | 预置轻量图表，或降级为表格汇总 |\n"
+            "| 导出表格 | 中 | 中文编码可能乱码 | 统一 UTF-8 BOM 或 Excel 兼容格式 |\n"
+            "| 本地存储 | 中 | 浏览器容量有限，清理缓存会丢失 | 限制附件大小，提供导出备份 |\n"
+            "| 移动端操作 | 中 | 手势/点击精度不足 | 使用大按钮，减少滑动依赖 |\n"
+        )
+        if "实现风险清单" not in body:
+            body += "\n\n## 五、实现风险清单\n" + risk_body
+        elif "离线" not in body or "编码" not in body:
+            body += "\n\n### 实现风险补充\n" + risk_body
+
+        # 6) 商业板块兜底
         extra_sections: list[str] = []
         if "外包" not in body:
             extra_sections.append(
-                "## 四、外包防坑报价参考\n"
+                "## 六、外包防坑报价参考\n"
                 "本产品属于轻量到中等复杂度。若找传统外包公司，报价通常在 "
                 "5000~20000 元，常见加价点是改需求、加页面和后期维护。"
                 "建议不要找全额外包，直接拿着这份说明书去 WorkBuddy 召唤"
-                "【微信小程序开发专家团】自己生成，成本近乎为零。"
+                "对应专家团自己生成，成本近乎为零。"
             )
         if "引流" not in body:
             extra_sections.append(
-                "## 五、发布与引流建议\n"
+                "## 七、发布与引流建议\n"
                 f"第一波冷启动建议从小红书开始：用「不懂代码的文科生，用 AI 花了 2 小时"
-                f"做了一个{self.outline.project_name}小程序」这类标题，配 3 张使用截图；"
+                f"做了一个{self.outline.project_name}产品」这类标题，配 3 张使用截图；"
                 "同步发朋友圈和 2~3 个目标用户社群。先把体验用户加到微信，"
                 "建立个人 IP，再考虑会员、定制或广告变现。"
             )
         if extra_sections:
-            body = body.rstrip() + "\n\n" + "\n\n".join(extra_sections)
+            body += "\n\n" + "\n\n".join(extra_sections)
+
+        # 7) 本次推断清单：从正文提取 + 基础字段兜底，保证 >=5 条
+        inferred: list[str] = []
+        for line in body.splitlines():
+            if "【我推断的】" in line:
+                item = (
+                    line.replace("【我推断的】", "")
+                    .strip()
+                    .lstrip("-* ")
+                    .strip()
+                )
+                if item and item not in inferred:
+                    inferred.append(item)
+        fallback_inferences = [
+            f"交付形态为{delivery}",
+            f"使用角色为{usage}",
+            f"审批角色为{approval}",
+            f"数据查看角色为{viewer}",
+            f"数据存放位置为{storage}",
+            f"上线/分发方式为{deploy}",
+        ]
+        for item in fallback_inferences:
+            if not any(item in existing for existing in inferred):
+                inferred.append(item)
+        inferred = inferred[:12]
+        inference_lines = [
+            "## 八、本次推断清单（请逐条确认）",
+            "| # | 我推断的内容 | 是否成立 |",
+            "| --- | --- | --- |",
+        ]
+        for idx, item in enumerate(inferred, 1):
+            inference_lines.append(f"| {idx} | {item} | 请回复 是/否 |")
+        body += "\n\n" + "\n".join(inference_lines)
 
         # 固定追加 WorkBuddy 提示，避免模型漏写
         prd = body.rstrip() + "\n\n" + config.PRD_WORKBUDDY_HINT + "\n"

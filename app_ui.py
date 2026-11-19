@@ -281,6 +281,7 @@ try:
             session is not None
             and session.phase == config.PHASE_CLARIFY
             and session.pending_question is None
+            and not session.missing_required_fields()
             and not _is_busy()
         ):
             st.session_state["requirement_input"] = session.requirement
@@ -341,9 +342,20 @@ try:
                 if ok:
                     st.rerun()
 
-        # 聊天输入框：只有「还没有会话」或「有待回答问题」时才允许输入；
-        # 追问结束后不再把用户输入当成回答，避免“当前没有待回答的问题”。
-        can_chat = session is None or session.pending_question is not None
+        # 聊天输入框：新建、待回答问题、或历史项目缺角色/交付形态时都允许输入
+        needs_required = (
+            session is not None and bool(session.missing_required_fields())
+        )
+        if needs_required and session.pending_question is None:
+            st.info(
+                "请先补充角色和交付形态（在下方输入框按格式回答）：\n"
+                + session.required_question_text()
+            )
+        can_chat = (
+            session is None
+            or session.pending_question is not None
+            or needs_required
+        )
         if can_chat:
             prompt = st.chat_input("说说你的想法，多离谱都行……")
             if prompt:
@@ -368,7 +380,11 @@ try:
         if not content:
             return
         is_new = session is None
-        if session is not None and session.pending_question is None:
+        if (
+            session is not None
+            and session.pending_question is None
+            and not session.missing_required_fields()
+        ):
             # 追问已完成/被跳过：不再把新消息当回答，避免 LogicError
             st.info(
                 "当前没有待回答的问题，请去「② 大纲确认」或「③ 产品说明书」；"
@@ -685,6 +701,8 @@ try:
             for item in tickets
             if item["filename"] == "产品需求说明书.md" or item.get("type") == "prd"
         ]
+        if prd_tickets and "基础假设" not in prd_tickets[0]["content_md"]:
+            st.warning("此版本未包含假设标注，建议重新生成产品说明书。")
         display_tickets = prd_tickets or tickets
         st.subheader(f"产品说明书预览：{project['name']}")
 

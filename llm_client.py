@@ -128,6 +128,10 @@ def _post(
         # 严格封顶输出 token，防止模型输出过长导致费用失控
         "max_tokens": config.LLM_MAX_OUTPUT_TOKENS,
     }
+    # 关闭思考模式：否则 reasoning 会吃掉 max_tokens，正文变空。
+    # GLM 的接口限制 enable_thinking 只能为 True，因此对它不传。
+    if "glm" not in model.lower():
+        payload["enable_thinking"] = False
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
@@ -148,6 +152,10 @@ def _post(
             )
             with httpx.Client(timeout=timeout) as client:
                 response = client.post(url, headers=headers, json=payload)
+                # 兼容不支持 enable_thinking 的模型：400 时去掉该参数重试一次
+                if response.status_code == 400 and "enable_thinking" in payload:
+                    payload.pop("enable_thinking", None)
+                    response = client.post(url, headers=headers, json=payload)
                 # 兼容不支持 response_format 的网关：400 时去掉该参数重试一次
                 if response.status_code == 400 and json_mode:
                     payload.pop("response_format", None)
