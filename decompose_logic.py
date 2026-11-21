@@ -72,6 +72,13 @@ class PMSession:
     roles: dict[str, str] = field(default_factory=dict)
     delivery_form: str = ""
     required_pending: bool = False
+    # V4.3 四步开场：usage_questions -> inference_confirm -> detail -> done
+    onboarding_step: str = ""
+    audience: str = ""
+    place: str = ""
+    result_viewer: str = ""
+    inference_pending: list[str] = field(default_factory=list)
+    detail_item: str = ""
     # V3.3.1：内存兜底数据（数据库暂存失败时用于生成 ZIP），不写入 JSON 快照
     generated_ticket_data: list[dict] = field(default_factory=list)
     db_sync_failed: bool = False
@@ -97,6 +104,12 @@ class PMSession:
             "roles": self.roles,
             "delivery_form": self.delivery_form,
             "required_pending": self.required_pending,
+            "onboarding_step": self.onboarding_step,
+            "audience": self.audience,
+            "place": self.place,
+            "result_viewer": self.result_viewer,
+            "inference_pending": self.inference_pending,
+            "detail_item": self.detail_item,
         }
 
     @classmethod
@@ -185,6 +198,14 @@ class PMSession:
             roles=roles,
             delivery_form=str(data.get("delivery_form", "")).strip(),
             required_pending=bool(data.get("required_pending", False)),
+            onboarding_step=str(data.get("onboarding_step", "")),
+            audience=str(data.get("audience", "")),
+            place=str(data.get("place", "")),
+            result_viewer=str(data.get("result_viewer", "")),
+            inference_pending=[
+                str(item) for item in data.get("inference_pending", [])
+            ],
+            detail_item=str(data.get("detail_item", "")),
         )
 
     # ------------------------------------------------------------------
@@ -327,15 +348,49 @@ class PMSession:
             missing.append("交付形态")
         return missing
 
-    def required_question_text(self) -> str:
-        """固定必答问题：一次收集三个角色 + 交付形态，不额外增加一轮。"""
-        return (
-            "开始前请一次性告诉我 4 件事（每行一项，照格式写）：\n"
-            "使用角色：___\n"
-            "审批角色：___\n"
-            "数据查看角色：___\n"
-            "交付形态（网页链接 / 单文件 HTML / 微信小程序 / 桌面软件 / Excel 工具 / 纯文档）：___"
+    def _requirement_summary(self) -> str:
+        """把“我想做个记账的”收敛成“记账的”，用于第一句复述。"""
+        text = re.sub(
+            r"^(我想做(?:个|一个)?|我想开发(?:个|一个)?|帮我做(?:个|一个)?|"
+            r"做(?:个|一个)?|开发(?:个|一个)?|想要(?:个|一个)?)",
+            "",
+            self.requirement.strip(),
         )
+        return (text.strip("。！!，, ") or self.requirement.strip())[:60]
+
+    def _usage_question_text(self) -> str:
+        """第 2 步：先复述，再问三个数字选项；只问还没答的。"""
+        lines = [
+            f"我理解你想做一个「{self._requirement_summary()}」，对吗？",
+            "",
+            "如果差不多，请回我三个数字：",
+        ]
+        if not self.audience:
+            lines.extend(
+                ["一、这东西谁用？", "1 我自己", "2 我的同事", "3 客户或外部的人", ""]
+            )
+        if not self.place:
+            lines.extend(
+                ["二、在哪儿用？", "1 手机上", "2 电脑上打开", "3 打印出来", ""]
+            )
+        if not self.result_viewer:
+            lines.extend(
+                ["三、做完的结果给谁看？", "1 只有我自己", "2 要给领导", "3 要给客户", ""]
+            )
+        lines.append("可以按顺序回，例如：1 1 1；也可以先只回一个数字。")
+        return "\n".join(lines).strip()
+
+    def _inference_question_text(self) -> str:
+        """第 3 步：只猜三件，用户只回“对/不对”。"""
+        labels = {
+            "approval": "1. 谁点头：我猜没有人需要点头，对吗？（对 / 不对）",
+            "viewer": "2. 结果给谁看：我猜只有你自己看，对吗？（对 / 不对）",
+            "delivery": "3. 在哪儿打开：我猜是网页链接（手机和电脑都能打开），对吗？（对 / 不对）",
+        }
+        lines = ["剩下三件我不问你，我先猜，你告诉我哪条不对。", ""]
+        lines.extend(labels[item] for item in self.inference_pending)
+        lines.extend(["", "可以按顺序回：对 对 对；哪条不对就回“不对”，我再问你。"])
+        return "\n".join(lines)
 
     def _normalize_delivery(self, value: str) -> str:
         """把用户口语化的交付形态收敛成标准选项。"""
@@ -355,47 +410,43 @@ class PMSession:
             return "网页链接"
         return text
 
-    def _parse_required_fields(self, text: str) -> None:
-        """解析“使用角色：X；审批角色：Y”这类回答；解析不出就保持缺失。"""
-        mapping = {
-            "使用角色": "usage",
-            "审批角色": "approval",
-            "数据查看角色": "viewer",
-            "交付形态": "delivery",
-        }
-        chunks = re.split(r"[；;，,\n]", text or "")
-        for chunk in chunks:
-            item = chunk.strip().lstrip("-* ").strip()
-            for label, field in mapping.items():
-                for sep in ("：", ":"):
-                    prefix = label + sep
-                    if not item.startswith(prefix):
-                        continue
-                    value = item[len(prefix):].strip()
-                    if not value:
-                        continue
-                    if field == "delivery":
-                        self.delivery_form = self._normalize_delivery(value)
-                    else:
-                        self.roles[field] = value
+    def _answer_usage_questions(self, text: str) -> Question | None:
+        """第 2 步：解析三个数字；只补问缺失项，绝不把三问再问一遍。"""
+        self.transcript.append({"role": "pm", "content": text})
+        numbers = re.findall(r"[123]", text or "")
+
+        def take() -> str:
+            return numbers.pop(0) if numbers else ""
+
+        if not self.audience:
+            self.audience = take()
+        if not self.place:
+            self.place = take()
+        if not self.result_viewer:
+            self.result_viewer = take()
+
+        # 关键词兜底：用户没回数字，也能听懂“手机/电脑/领导”
+        if not self.audience:
+            for word, value in (("同事", "2"), ("客户", "3"), ("外部", "3"), ("自己", "1")):
+                if word in text:
+                    self.audience = value
+                    break
+        if not self.place:
+            for word, value in (("手机", "1"), ("电脑", "2"), ("打印", "3")):
+                if word in text:
+                    self.place = value
+                    break
+        if not self.result_viewer:
+            for word, value in (("领导", "2"), ("客户", "3"), ("自己", "1")):
+                if word in text:
+                    self.result_viewer = value
                     break
 
-    def _answer_required(
-        self,
-        text: str,
-        progress: Callable[[str], None] | None = None,
-    ) -> Question | None:
-        """处理必答项回答；缺项时继续问同一组问题，不默认成老板/小程序。"""
-        self.required_pending = True
-        self.transcript.append({"role": "pm", "content": text})
-        self._parse_required_fields(text)
-        missing = self.missing_required_fields()
-
-        if missing:
+        if not (self.audience and self.place and self.result_viewer):
             self.pending_question = Question(
                 need_more_info=True,
-                question=self.required_question_text(),
-                reason=f"还缺：{'、'.join(missing)}；这四项不能默认。",
+                question=self._usage_question_text(),
+                reason="还差一个数字，先确认这个。",
                 options=[],
             )
             self.transcript.append(
@@ -404,51 +455,150 @@ class PMSession:
             session_store.save_state(self)
             return self.pending_question
 
-        self.required_pending = False
-        self.pending_question = None
-
-        # 从历史项目恢复、已经确认过大纲的场景：补齐后直接回原阶段，不再追问
-        if self.phase != config.PHASE_CLARIFY:
-            session_store.save_state(self)
-            return None
-
-        self.round = max(self.round, 1)
-        if self.round >= config.MAX_CLARIFY_ROUNDS:
-            self.phase = config.PHASE_OUTLINE
-            session_store.save_state(self)
-            return None
-
-        try:
-            question = self._ask(progress)
-        except Exception as exc:
-            # AI 暂时不可用：保留已收集的角色，给一个可回答的兜底问题，避免状态机清空
-            print(f"[pm] 必答项补齐后追问失败：{type(exc).__name__}: {str(exc)[:120]}")
-            self.pending_question = Question(
-                need_more_info=True,
-                question="请再补充一下：这个产品最核心的一个使用场景是什么？",
-                reason="AI 暂时没有响应，先继续收集关键信息。",
-                options=[],
-            )
-            self.transcript.append(
-                {"role": "assistant", "content": self.pending_question.question}
-            )
-            session_store.save_state(self)
-            return self.pending_question
-
-        if not question.need_more_info or not question.question.strip():
-            self.phase = config.PHASE_OUTLINE
-            session_store.save_state(self)
-            return None
-        self.pending_question = question
-        self.transcript.append({"role": "assistant", "content": question.question})
+        self.roles["usage"] = {
+            "1": "你自己",
+            "2": "你的同事",
+            "3": "客户或外部用户",
+        }[self.audience]
+        self.roles["viewer"] = {
+            "1": "你自己",
+            "2": "你的领导",
+            "3": "你的客户",
+        }[self.result_viewer]
+        self.roles["approval"] = ""
+        self.delivery_form = ""
+        self.onboarding_step = "inference_confirm"
+        self.inference_pending = ["approval", "viewer", "delivery"]
+        self.pending_question = Question(
+            need_more_info=True,
+            question=self._inference_question_text(),
+            reason="先猜，再让你确认，减少你的输入。",
+            options=[],
+        )
+        self.transcript.append(
+            {"role": "assistant", "content": self.pending_question.question}
+        )
         session_store.save_state(self)
-        return question
+        return self.pending_question
+
+    def _accept_inference_guess(self, item: str) -> None:
+        """用户回“对”：接受默认推断。"""
+        if item == "approval":
+            self.roles["approval"] = "没有人需要点头"
+        elif item == "viewer":
+            self.roles["viewer"] = "你自己"
+        elif item == "delivery":
+            self.delivery_form = "网页链接"
+
+    def _begin_inference_detail(self, item: str) -> Question:
+        """用户回“不对”：只追问这一条，不重新问另外两条。"""
+        self.detail_item = item
+        self.onboarding_step = "detail"
+        if item == "approval":
+            text = "那谁点头？直接说岗位或名字就行。"
+        elif item == "viewer":
+            text = "那结果给谁看？直接说岗位或名字就行。"
+        else:
+            text = (
+                "那你想怎么拿到结果？\n"
+                "1 发网页链接\n"
+                "2 发一个文件（双击打开）\n"
+                "3 微信小程序\n"
+                "4 Excel 或文档"
+            )
+        self.pending_question = Question(
+            need_more_info=True,
+            question=text,
+            reason="按你的实际情况改一下。",
+            options=[],
+        )
+        self.transcript.append(
+            {"role": "assistant", "content": self.pending_question.question}
+        )
+        session_store.save_state(self)
+        return self.pending_question
+
+    def _answer_inference_confirm(self, text: str) -> Question | None:
+        """第 3 步：按顺序解析“对/不对”，只补问未确认项。"""
+        self.transcript.append({"role": "pm", "content": text})
+        tokens = re.findall(r"不对|对", text or "")
+        for token in tokens:
+            if not self.inference_pending:
+                break
+            item = self.inference_pending.pop(0)
+            if token == "对":
+                self._accept_inference_guess(item)
+                continue
+            if item == "viewer" and self.result_viewer in ("2", "3"):
+                # 第二问已经说了给领导/客户，这里直接按那个角色，不再问
+                self.roles["viewer"] = {
+                    "2": "你的领导",
+                    "3": "你的客户",
+                }[self.result_viewer]
+                continue
+            return self._begin_inference_detail(item)
+
+        if self.detail_item:
+            return self.pending_question
+        return self._continue_inference()
+
+    def _answer_inference_detail(self, text: str) -> Question | None:
+        """处理“不对”后的单条补充，然后继续未确认项。"""
+        self.transcript.append({"role": "pm", "content": text})
+        item = self.detail_item
+        if item == "approval":
+            self.roles["approval"] = text.strip() or "有人需要点头"
+        elif item == "viewer":
+            self.roles["viewer"] = text.strip() or "你自己"
+        elif item == "delivery":
+            self.delivery_form = {
+                "1": "网页链接",
+                "2": "单文件 HTML",
+                "3": "微信小程序",
+                "4": "Excel 工具",
+            }.get(text.strip(), self._normalize_delivery(text))
+        self.detail_item = ""
+        return self._continue_inference()
+
+    def _continue_inference(self) -> Question | None:
+        """还有未确认项就只问剩下的；全部确认完进入大纲阶段。"""
+        if not self.inference_pending:
+            return self._finish_onboarding()
+        self.onboarding_step = "inference_confirm"
+        self.pending_question = Question(
+            need_more_info=True,
+            question=self._inference_question_text(),
+            reason="还剩几条，很快。",
+            options=[],
+        )
+        self.transcript.append(
+            {"role": "assistant", "content": self.pending_question.question}
+        )
+        session_store.save_state(self)
+        return self.pending_question
+
+    def _finish_onboarding(self) -> None:
+        """三条确认完：允许去生成大纲，不再追问。"""
+        self.onboarding_step = "done"
+        self.detail_item = ""
+        self.inference_pending = []
+        self.pending_question = None
+        self.phase = config.PHASE_OUTLINE
+        self.transcript.append(
+            {
+                "role": "assistant",
+                "content": "好，我按这些推断继续。去「② 大纲确认」生成大纲，确认后再生成产品说明书。",
+            }
+        )
+        session_store.save_state(self)
+        return None
+
+    # 旧的四字段必答流程已由四步开场替代，保留门禁方法供大纲/PRD 校验。
 
     def _ensure_required_fields(self) -> None:
-        """生成大纲/说明书前的硬门禁：角色和交付形态必须明确。"""
-        missing = self.missing_required_fields()
-        if missing:
-            raise LogicError("请先补充：" + "、".join(missing))
+        """生成大纲/说明书前的硬门禁：开场三件必须确认完。"""
+        if self.missing_required_fields():
+            raise LogicError("还差一点信息，请回到「① 需求与追问」把开头三件确认完。")
 
     def _ask(self, progress: Callable[[str], None] | None = None) -> Question:
         """调用模型生成一个追问。
@@ -465,38 +615,28 @@ class PMSession:
         return parse_question(data)
 
     def start(self, progress: Callable[[str], None] | None = None) -> Question:
-        """开始第一阶段：先收集必答项，再生成第一个追问。"""
+        """开始第一阶段：复述需求 + 三个数字问题（不调用大模型）。"""
         self.phase = config.PHASE_CLARIFY
         self.round = 0
         self.transcript = []
-
-        if self.missing_required_fields():
-            self.required_pending = True
-            question = Question(
-                need_more_info=True,
-                question=self.required_question_text(),
-                reason="这四项决定说明书里的角色名、交付方式和风险判断，不能默认。",
-                options=[],
-            )
-            self._ensure_project()
-            self.pending_question = question
-            self.transcript.append({"role": "assistant", "content": question.question})
-            session_store.save_state(self)
-            return question
-
-        self.required_pending = False
-        question = self._ask(progress)
-        # 追问生成成功后再建项目，避免千问失败时留下空项目
+        self.onboarding_step = "usage_questions"
+        self.audience = ""
+        self.place = ""
+        self.result_viewer = ""
+        self.inference_pending = []
+        self.detail_item = ""
+        self.roles = {}
+        self.delivery_form = ""
+        question = Question(
+            need_more_info=True,
+            question=self._usage_question_text(),
+            reason="先复述你的想法，再用三个数字确认使用场景。",
+            options=[],
+        )
         self._ensure_project()
-        if not question.need_more_info or not question.question.strip():
-            # 模型判断信息已足够：不制造无意义追问，直接允许生成大纲
-            self.phase = config.PHASE_OUTLINE
-            self.pending_question = None
-            session_store.save_state(self)  # 先落盘再返回，F5 后可恢复
-            return question
         self.pending_question = question
         self.transcript.append({"role": "assistant", "content": question.question})
-        session_store.save_state(self)  # 追问生成后立即落盘
+        session_store.save_state(self)
         return question
 
     def answer(
@@ -511,8 +651,12 @@ class PMSession:
         text = (text or "").strip()
         if not text:
             raise LogicError("回答不能为空")
-        if self.required_pending or self.missing_required_fields():
-            return self._answer_required(text, progress)
+        if self.onboarding_step == "usage_questions":
+            return self._answer_usage_questions(text)
+        if self.onboarding_step == "inference_confirm":
+            return self._answer_inference_confirm(text)
+        if self.onboarding_step == "detail":
+            return self._answer_inference_detail(text)
         if self.pending_question is None:
             raise LogicError("当前没有待回答的问题")
 
@@ -561,17 +705,10 @@ class PMSession:
         """
         if self.phase != config.PHASE_CLARIFY:
             return
-        if self.missing_required_fields():
-            # 角色/交付形态没收集齐时不允许跳过，否则只能默认成老板/小程序
-            self.required_pending = True
-            self.pending_question = Question(
-                need_more_info=True,
-                question=self.required_question_text(),
-                reason="请先补齐角色和交付形态，不能跳过。",
-                options=[],
-            )
+        if self.onboarding_step not in ("", "done"):
+            # 四步开场还没确认完：不跳过，也不用内部术语解释
             self.transcript.append(
-                {"role": "assistant", "content": "请先补齐角色和交付形态，再跳过追问。"}
+                {"role": "assistant", "content": "先把这三件确认完，马上就能生成，不用等很久。"}
             )
             session_store.save_state(self)
             return

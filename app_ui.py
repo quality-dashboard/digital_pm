@@ -26,7 +26,7 @@ import streamlit as st
 # 注意：必须放在 import config 之前。config 导入时会读取 st.secrets（云端配置），
 # 先读 secrets 会让 set_page_config 不再是「第一个命令」而直接报错。
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="数字项目经理 V3.1.2", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="数字产品经理 V3.1.2", page_icon="🧭", layout="wide")
 
 try:
 
@@ -58,7 +58,8 @@ try:
 
     # 需求文本长度约束：
     # 下限 20 字拦截「做个系统」这类无信息量输入，上限 8000 字防止超长文本打爆大模型 Token
-    REQ_MIN_CHARS = 20
+    # 四步开场允许“一句话”，只拦纯空输入；不再要求 20 字以上
+    REQ_MIN_CHARS = 2
     REQ_MAX_CHARS = 8000
 
 
@@ -69,7 +70,7 @@ try:
         st.session_state["access_ok"] = False
 
     if not st.session_state["access_ok"]:
-        st.title("数字项目经理 V3.1.2")
+        st.title("数字产品经理 V3.1.2")
         st.caption("内部体验版 · 请先输入访问码")
 
         access_code = st.text_input(
@@ -291,7 +292,8 @@ try:
 
         # 首次进入的主动打招呼（常驻在对话开头）
         with st.chat_message("assistant"):
-            st.write("你好，我是你的数字项目经理。你想开发什么应用？随便说，多离谱都行。")
+            st.write("不用管说得清不清楚，用大白话就行。")
+            st.write("你想做个什么？一句话，粗糙也没关系。")
 
         # 历史对话：pm -> user，其余 -> assistant
         if session:
@@ -321,8 +323,12 @@ try:
                 ):
                     _handle_chat_message(session, option)
 
-        # 逃生门：不想继续被追问，直接进入大纲
-        if session and session.pending_question:
+        # 逃生门：旧追问流程才显示；新的四步开场不提供跳过，避免绕过确认
+        if (
+            session
+            and session.pending_question
+            and session.onboarding_step in ("", "done")
+        ):
             if st.button(
                 "赶时间？跳过追问，直接生成大纲 →",
                 disabled=_is_busy(),
@@ -342,22 +348,10 @@ try:
                 if ok:
                     st.rerun()
 
-        # 聊天输入框：新建、待回答问题、或历史项目缺角色/交付形态时都允许输入
-        needs_required = (
-            session is not None and bool(session.missing_required_fields())
-        )
-        if needs_required and session.pending_question is None:
-            st.info(
-                "请先补充角色和交付形态（在下方输入框按格式回答）：\n"
-                + session.required_question_text()
-            )
-        can_chat = (
-            session is None
-            or session.pending_question is not None
-            or needs_required
-        )
+        # 聊天输入框：新建或有待回答问题即可输入；四步开场不使用按钮
+        can_chat = session is None or session.pending_question is not None
         if can_chat:
-            prompt = st.chat_input("说说你的想法，多离谱都行……")
+            prompt = st.chat_input("用大白话写下你的想法……")
             if prompt:
                 _handle_chat_message(session, prompt)
         elif session and session.phase in (

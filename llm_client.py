@@ -78,15 +78,12 @@ def is_configured() -> bool:
 
 
 def _model_pool() -> list[str]:
-    """模型池：仅在用户配置的模型属于可用池时优先，否则按 MODELS 顺序。
+    """固定顺序：deepseek-v4.1-flash-1017 -> qwen3.8-flash -> glm-5.3。
 
-    这样即使 .env / Secrets 里还留着已过期的 qwen-plus，也不会每次先撞一次
-    失败再切换，直接使用探测出的可用模型。
+    不读取 DASHSCOPE_MODEL 覆盖顺序，避免旧配置把主模型改回 qwen。
+    原主模型仍保存在 config.ROLLBACK_MODEL，回归不过时直接切回。
     """
-    configured = (config.DASHSCOPE_MODEL or "").strip()
-    ordered: list[str] = [configured] if configured and configured in MODELS else []
-    ordered.extend(model for model in MODELS if model not in ordered)
-    return ordered
+    return list(MODELS)
 
 
 def primary_model() -> str:
@@ -236,6 +233,15 @@ def _call(
 
     for index, model in enumerate(models, start=1):
         role = "主模型" if index == 1 else f"备用模型 {index - 1}"
+        switch_count = index - 1
+        switch_reason = (
+            "主模型首次请求"
+            if switch_count == 0
+            else f"上一模型失败后切换（{type(last_error).__name__ if last_error else '未知'}）"
+        )
+        print(
+            f"[llm] 本次请求模型={model} 第{switch_count}次切换 原因={switch_reason}"
+        )
         _notify(progress, f"正在尝试{role} {model}（{index}/{total}）…")
         started = time.monotonic()
 
@@ -260,6 +266,9 @@ def _call(
             reason = "响应超时" if isinstance(exc, LLMTimeoutError) else "暂时不可用"
             print(f"[llm] {model} 失败（{waited:.0f}s，{reason}）：{str(exc)[:120]}")
             if index < total:
+                print(
+                    f"[llm] 切换 #{index} -> {models[index]} 原因={type(exc).__name__}: {str(exc)[:120]}"
+                )
                 _notify(
                     progress,
                     f"{role} {model} {reason}（已等待 {waited:.0f} 秒），"

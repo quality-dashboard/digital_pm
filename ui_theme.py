@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ui_theme.py —— Router（数字项目经理）UI 主题层
+ui_theme.py —— Router（数字产品经理）UI 主题层
 
 职责：
   ① 把 router_theme.css 注入 Streamlit 页面
@@ -102,7 +102,7 @@ def render_header(
         f"""
         <div class="pm-header">
           <div class="pm-brand">
-            <span class="pm-brand-name">数字项目经理</span>
+            <span class="pm-brand-name">数字产品经理</span>
             <span class="pm-brand-sub">Router</span>
           </div>
           <div class="pm-steps">{''.join(parts)}</div>

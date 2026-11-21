@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-config.py —— V5.0「数字项目经理」全局配置与规则库
+config.py —— V5.0「数字产品经理」全局配置与规则库
 
 本文件只做四件事：
 1. 定义协作偏好 USER_PROFILE（产品经理的沟通与决策习惯）；
@@ -298,12 +298,15 @@ DASHSCOPE_BASE_URL: str = read_setting(
 # V3.3.5：切换到账号下有额度的三个文本模型（按推荐顺序）。
 # qwen3.8-flash 放首位：百炼自家模型，OpenAI 兼容协议最稳；
 # glm-5.3 / deepseek-v4.1-flash 作为 fallback，失败自动切换。
+PRIMARY_MODEL: str = "deepseek-v4.1-flash-1017"
+# 原主模型保留在配置里：三条回归任一不过，直接把 LLM_MODELS 切回 ROLLBACK_MODEL
+ROLLBACK_MODEL: str = "qwen3.8-flash"
 LLM_MODELS: tuple[str, ...] = (
-    "qwen3.8-flash",
+    PRIMARY_MODEL,
+    ROLLBACK_MODEL,
     "glm-5.3",
-    "deepseek-v4.1-flash",
 )
-DASHSCOPE_MODEL: str = read_setting("DASHSCOPE_MODEL", "qwen3.8-flash")
+DASHSCOPE_MODEL: str = read_setting("DASHSCOPE_MODEL", PRIMARY_MODEL)
 # 工单是长文本，且 qwen/glm 会先输出 reasoning；
 # 4000 仍可能被较长思考过程挤占，给到 6000 留足正文空间。
 LLM_MAX_OUTPUT_TOKENS: int = 6000

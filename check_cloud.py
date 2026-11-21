@@ -69,7 +69,7 @@ def main() -> None:
     sec_url = str(secrets.get("TURSO_DATABASE_URL", "")).strip()
     sec_token = str(secrets.get("TURSO_AUTH_TOKEN", "")).strip()
 
-    print("=== 数字项目经理 V3.2.0 数据层自检 ===")
+    print("=== 数字产品经理 V3.2.0 数据层自检 ===")
     print("配置优先级：环境变量(.env) > Streamlit Secrets > 默认值")
     print("SECRETS_FILE:", secrets_path or "<未找到>")
     print("ENV_URL:", env_url or "<empty>")
