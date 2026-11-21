@@ -51,6 +51,29 @@ DELIVERY_FORMS: tuple[str, ...] = (
     "纯文档",
 )
 
+# FDE 五层问题地图：来自售前见客户的真实顺序，不是产品流程。
+# ① 听现状 -> ② 画流程 -> ③ 摸数据 -> ④ 定角色 -> ⑤ 划边界。
+# 顺序不能换：第③层漏掉，方案会在实施阶段死在“数据根本导不进来”。
+#
+# 面试三句话：
+# 1. 客户说的和他要的是两个东西：他说“要个报表”，真实痛点是“每周花两天核对”。
+# 2. 售前最容易漏的是第三层：数据在三个系统里、格式不统一、没人负责导，方案当场作废。
+# 3. 所以我把“该问什么”从靠经验，变成一张画得出来、勾得完的地图。
+LAYER_NAMES: dict[int, str] = {
+    1: "为什么存在",
+    2: "现在怎么走",
+    3: "数据从哪来",
+    4: "谁在用",
+    5: "边界",
+}
+LAYER_STATUS_LABELS: dict[str, str] = {
+    "not_started": "未开始",
+    "in_progress": "进行中",
+    "full": "已勾满",
+    "skipped": "已跳过",
+    "pending": "待确认",
+}
+
 
 @dataclass
 class PMSession:
@@ -79,6 +102,13 @@ class PMSession:
     result_viewer: str = ""
     inference_pending: list[str] = field(default_factory=list)
     detail_item: str = ""
+    # V5 五层问题地图
+    layer_status: dict[int, str] = field(default_factory=dict)
+    layer_answers: dict[int, list[str]] = field(default_factory=dict)
+    layer_summary: dict[int, str] = field(default_factory=dict)
+    layer_index: int = 0
+    layer_sub_index: int = 0
+    layer_unknown: int = 0
     # V3.3.1：内存兜底数据（数据库暂存失败时用于生成 ZIP），不写入 JSON 快照
     generated_ticket_data: list[dict] = field(default_factory=list)
     db_sync_failed: bool = False
@@ -110,6 +140,12 @@ class PMSession:
             "result_viewer": self.result_viewer,
             "inference_pending": self.inference_pending,
             "detail_item": self.detail_item,
+            "layer_status": self.layer_status,
+            "layer_answers": self.layer_answers,
+            "layer_summary": self.layer_summary,
+            "layer_index": self.layer_index,
+            "layer_sub_index": self.layer_sub_index,
+            "layer_unknown": self.layer_unknown,
         }
 
     @classmethod
@@ -206,6 +242,22 @@ class PMSession:
                 str(item) for item in data.get("inference_pending", [])
             ],
             detail_item=str(data.get("detail_item", "")),
+            layer_status={
+                int(key): str(value)
+                for key, value in (data.get("layer_status") or {}).items()
+            },
+            layer_answers={
+                int(key): [str(item) for item in value]
+                for key, value in (data.get("layer_answers") or {}).items()
+                if isinstance(value, list)
+            },
+            layer_summary={
+                int(key): str(value)
+                for key, value in (data.get("layer_summary") or {}).items()
+            },
+            layer_index=int(data.get("layer_index", 0) or 0),
+            layer_sub_index=int(data.get("layer_sub_index", 0) or 0),
+            layer_unknown=int(data.get("layer_unknown", 0) or 0),
         )
 
     # ------------------------------------------------------------------
@@ -312,9 +364,10 @@ class PMSession:
     # 追问阶段
     # ------------------------------------------------------------------
     def _qa_digest(self) -> str:
-        """把需求、回答、已问问题压缩成短上下文（不传完整对话历史）。"""
-        answers = [item["content"] for item in self.transcript if item["role"] == "pm"]
-        asked = [item["content"] for item in self.transcript if item["role"] == "assistant"]
+        """只带最近 6 轮上下文，避免全量对话塞爆 prompt。"""
+        recent = self.transcript[-12:]
+        answers = [item["content"] for item in recent if item["role"] == "pm"]
+        asked = [item["content"] for item in recent if item["role"] == "assistant"]
 
         lines = [f"原始需求：{self.requirement}", ""]
         if answers:
@@ -332,6 +385,12 @@ class PMSession:
                     lines.append(f"- {label}：{self.roles[key]}")
             if self.delivery_form:
                 lines.append(f"- 交付形态：{self.delivery_form}")
+        if self.layer_summary:
+            lines.extend(["", "五层访谈摘要（必须沿用，不要重新发明）："])
+            for layer in range(1, 6):
+                summary = self.layer_summary.get(layer)
+                if summary:
+                    lines.append(f"- 第{layer}层 {LAYER_NAMES.get(layer, '')}：{summary}")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -593,7 +652,250 @@ class PMSession:
         session_store.save_state(self)
         return None
 
-    # 旧的四字段必答流程已由四步开场替代，保留门禁方法供大纲/PRD 校验。
+    # ------------------------------------------------------------------
+    # V5 五层问题地图（一次只问一个，下层不开启）
+    # ------------------------------------------------------------------
+    def _layer_question_text(self) -> str:
+        layer, sub = self.layer_index, self.layer_sub_index
+        if layer == 1:
+            if sub == 0:
+                if any(word in self.requirement for word in ("记账", "记")):
+                    return "你现在是怎么记的？"
+                return "这件事你现在是怎么做的？"
+            if sub == 1:
+                return "哪一步最烦？"
+            return "做错了，代价有多大？"
+        if layer == 2:
+            return (
+                "现在这件事分几步走？",
+                "每一步分别是谁在做？",
+                "多久做一次？",
+            )[sub]
+        if layer == 3:
+            return (
+                "数据从哪拿？谁给你的？",
+                "是什么格式？",
+                "多久更新一次？",
+            )[sub]
+        if layer == 4:
+            return (
+                "谁负责录入？",
+                "谁点头/谁批准？",
+                "谁看结果？",
+            )[sub]
+        if layer == 5:
+            return "第一版明确不做什么？"
+        return ""
+
+    def _layer_question_count(self, layer: int) -> int:
+        return 1 if layer == 5 else 3
+
+    def _layer_summary_text(self, layer: int) -> str:
+        answers = self.layer_answers.get(layer, [])
+        if self.layer_status.get(layer) == "skipped":
+            return "【已跳过】未确认"
+        if self.layer_status.get(layer) == "pending":
+            return "【待确认】"
+        if layer == 1 and len(answers) >= 3:
+            return f"现状：{answers[0]}；最烦：{answers[1]}；代价：{answers[2]}"
+        if layer == 2 and len(answers) >= 3:
+            return f"流程：{answers[0]}；谁做：{answers[1]}；频率：{answers[2]}"
+        if layer == 3 and len(answers) >= 3:
+            return f"来源：{answers[0]}；格式：{answers[1]}；更新：{answers[2]}"
+        if layer == 4 and len(answers) >= 3:
+            return f"录入：{answers[0]}；点头：{answers[1]}；查看：{answers[2]}"
+        if layer == 5 and answers:
+            return f"第一版不做：{answers[0]}"
+        return ""
+
+    def _answer_layer(self, text: str) -> Question | None:
+        """当前层只推进一步；不跨层、不连发多问。"""
+        self.transcript.append({"role": "pm", "content": text})
+        current = self.layer_index
+
+        if any(word in text for word in ("不重要", "跳过", "不需要聊")):
+            self.layer_status[current] = "skipped"
+            self.layer_summary[current] = "【已跳过】未确认"
+            return self._advance_layer()
+
+        if any(word in text for word in ("不知道", "不清楚", "没统计", "答不上", "没有数据")):
+            self.layer_unknown += 1
+            if self.layer_unknown >= 3:
+                # 连续三次答不上：标待确认，绝不替他编
+                self.layer_status[current] = "pending"
+                self.layer_summary[current] = "【待确认】"
+                return self._advance_layer()
+            self.pending_question = Question(
+                need_more_info=True,
+                question=self._layer_question_text(),
+                reason="没关系，我先记【待确认】；你按知道的说就行。",
+                options=[],
+            )
+            self.transcript.append(
+                {"role": "assistant", "content": self.pending_question.question}
+            )
+            session_store.save_state(self)
+            return self.pending_question
+
+        answers = self.layer_answers.setdefault(current, [])
+        answers.append(text)
+        self.layer_unknown = 0
+        self.layer_sub_index += 1
+
+        if self.layer_sub_index >= self._layer_question_count(current):
+            self.layer_status[current] = "full"
+            self.layer_summary[current] = self._layer_summary_text(current)
+            return self._advance_layer()
+
+        self.pending_question = Question(
+            need_more_info=True,
+            question=self._layer_question_text(),
+            reason="这一层还没聊完，继续。",
+            options=[],
+        )
+        self.transcript.append(
+            {"role": "assistant", "content": self.pending_question.question}
+        )
+        session_store.save_state(self)
+        return self.pending_question
+
+    def _advance_layer(self) -> Question | None:
+        """当前层结束才开启下一层；五层结束进入确认单。"""
+        next_layer = self.layer_index + 1
+        if next_layer > 5:
+            self.layer_index = 0
+            self.layer_sub_index = 0
+            self.layer_unknown = 0
+            self.pending_question = None
+            self.phase = config.PHASE_OUTLINE
+            self.transcript.append(
+                {
+                    "role": "assistant",
+                    "content": "五层聊完了。先看需求确认单，确认后再展开完整 PRD。",
+                }
+            )
+            session_store.save_state(self)
+            return None
+
+        self.layer_index = next_layer
+        self.layer_sub_index = 0
+        self.layer_unknown = 0
+        self.layer_status[next_layer] = "in_progress"
+        self.pending_question = Question(
+            need_more_info=True,
+            question=self._layer_question_text(),
+            reason="一层一层来，不跳层。",
+            options=[],
+        )
+        self.transcript.append(
+            {"role": "assistant", "content": self.pending_question.question}
+        )
+        session_store.save_state(self)
+        return self.pending_question
+
+    def document_gate(self) -> tuple[bool, str]:
+        """硬门禁：五层必须全部“已勾满”或“已跳过”，否则不生成文档。"""
+        missing = [
+            layer
+            for layer in range(1, 6)
+            if self.layer_status.get(layer) not in ("full", "skipped")
+        ]
+        if missing:
+            return (
+                False,
+                f"还有 {len(missing)} 层没聊透，现在出文档一定是偏的。"
+                f"我们先说第 {missing[0]} 层。",
+            )
+        return True, ""
+
+    def build_confirmation_sheet(self) -> str:
+        """生成《需求确认单》五栏；缺一层就拒绝，不调用模型。"""
+        ok, message = self.document_gate()
+        if not ok:
+            raise LogicError(message)
+
+        def answer(layer: int, index: int = 0) -> str:
+            if self.layer_status.get(layer) == "skipped":
+                return "【已跳过】未确认"
+            if self.layer_status.get(layer) == "pending":
+                return "【待确认】"
+            values = self.layer_answers.get(layer, [])
+            return values[index] if len(values) > index else "【待确认】"
+
+        lines = [
+            "# 需求确认单",
+            "",
+            "## 一、客户原话",
+            self.requirement.strip(),
+            "",
+            "## 二、我理解你要解决的是",
+            f"{self.layer_summary.get(1, '【待确认】')}；{self.layer_summary.get(2, '【待确认】')}",
+            "",
+            "## 三、第一版做这几件",
+            f"- 按现在的流程跑通：{answer(2, 0)}",
+            f"- 每一步有人负责：{answer(2, 1)}",
+            f"- 按这个频率先跑起来：{answer(2, 2)}",
+            "",
+            "## 四、第一版不做这几件",
+            f"- {answer(5, 0)}",
+            "",
+            "## 五、你需要提供的东西",
+            f"- 数据：{self.layer_summary.get(3, '【待确认】')}",
+            f"- 配合的人：{self.layer_summary.get(4, '【待确认】')}",
+            "- 请确认：谁配合、给什么数据、开什么权限、什么时候能给。",
+        ]
+        return "\n".join(lines)
+
+    def _infer_delivery_from_requirement(self) -> str:
+        text = self.requirement.lower()
+        if "小程序" in text:
+            return "微信小程序"
+        if "excel" in text or "表格" in text:
+            return "Excel 工具"
+        if "文档" in text:
+            return "纯文档"
+        return "网页链接"
+
+    def ensure_outline_from_layers(self) -> Outline:
+        """五层确认后，用确认单直接生成一个可开 PRD 的大纲。"""
+        ok, message = self.document_gate()
+        if not ok:
+            raise LogicError(message)
+        usage = self.layer_answers.get(4, ["待确认", "待确认", "待确认"])
+        self.roles = {
+            "usage": usage[0] if len(usage) > 0 else "待确认",
+            "approval": usage[1] if len(usage) > 1 else "待确认",
+            "viewer": usage[2] if len(usage) > 2 else "待确认",
+        }
+        self.delivery_form = self._infer_delivery_from_requirement()
+        name = self.project_name or self._requirement_summary()[:16] or "未命名项目"
+        self.project_name = name
+        self.project_slug = config.slugify_project_name(name)
+        self.outline = Outline(
+            project_name=name,
+            summary=f"{self.layer_summary.get(1, '')}；{self.layer_summary.get(2, '')}",
+            modules=[
+                Module(name="需求确认", goal="把五层访谈结论固化为确认单", kind="doc"),
+                Module(
+                    name="核心流程",
+                    goal="按确认单跑通第一版流程",
+                    kind="backend",
+                    depends_on=["需求确认"],
+                ),
+                Module(
+                    name="验收",
+                    goal="按确认单逐条验收",
+                    kind="test",
+                    depends_on=["核心流程"],
+                ),
+            ],
+            research_needed=False,
+        )
+        self.outline_confirmed = True
+        self.phase = config.PHASE_CONFIRMED
+        self._sync_project()
+        session_store.save_state(self)
+        return self.outline
 
     def _ensure_required_fields(self) -> None:
         """生成大纲/说明书前的硬门禁：开场三件必须确认完。"""
@@ -615,22 +917,24 @@ class PMSession:
         return parse_question(data)
 
     def start(self, progress: Callable[[str], None] | None = None) -> Question:
-        """开始第一阶段：复述需求 + 三个数字问题（不调用大模型）。"""
+        """开始五层问题地图：第一屏从第 1 层第一个问题开始。"""
         self.phase = config.PHASE_CLARIFY
         self.round = 0
         self.transcript = []
-        self.onboarding_step = "usage_questions"
-        self.audience = ""
-        self.place = ""
-        self.result_viewer = ""
-        self.inference_pending = []
-        self.detail_item = ""
+        self.layer_status = {layer: "not_started" for layer in range(1, 6)}
+        self.layer_answers = {}
+        self.layer_summary = {}
+        self.layer_index = 1
+        self.layer_sub_index = 0
+        self.layer_unknown = 0
+        self.layer_status[1] = "in_progress"
+        self.onboarding_step = ""
         self.roles = {}
         self.delivery_form = ""
         question = Question(
             need_more_info=True,
-            question=self._usage_question_text(),
-            reason="先复述你的想法，再用三个数字确认使用场景。",
+            question=self._layer_question_text(),
+            reason="先聊第 1 层：这件事现在怎么做的。",
             options=[],
         )
         self._ensure_project()
@@ -651,6 +955,8 @@ class PMSession:
         text = (text or "").strip()
         if not text:
             raise LogicError("回答不能为空")
+        if self.layer_index > 0:
+            return self._answer_layer(text)
         if self.onboarding_step == "usage_questions":
             return self._answer_usage_questions(text)
         if self.onboarding_step == "inference_confirm":
@@ -823,6 +1129,9 @@ class PMSession:
             if progress:
                 progress(message)
 
+        ok, message = self.document_gate()
+        if not ok:
+            raise LogicError(message)
         if not self.outline_confirmed or self.outline is None:
             raise LogicError("请先确认大纲，再生成产品说明书")
         self._ensure_required_fields()

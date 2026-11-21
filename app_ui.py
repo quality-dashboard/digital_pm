@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 
@@ -431,6 +432,139 @@ try:
             st.rerun()
 
 
+    def render_layer_map(session: decompose_logic.PMSession | None) -> None:
+        """左侧常驻地图：层名 / 状态 / 勾满后一句话小结。"""
+        statuses = session.layer_status if session else {}
+        st.markdown("**五层问题地图**")
+        for layer, name in decompose_logic.LAYER_NAMES.items():
+            status = statuses.get(layer, "not_started")
+            label = decompose_logic.LAYER_STATUS_LABELS.get(status, status)
+            if status == "skipped":
+                label = f":gray[{label}]"
+            elif status == "pending":
+                label = f":orange[{label}]"
+            st.markdown(f"{layer}. {name} ｜ {label}")
+            if session and status == "full" and session.layer_summary.get(layer):
+                st.caption(session.layer_summary[layer])
+
+
+    def _start_layer_session(requirement: str) -> None:
+        """从场景按钮/自定义一句话启动五层访谈。"""
+        try:
+            session = decompose_logic.PMSession(
+                requirement=requirement,
+                session_id=session_id,
+            )
+            session.start()
+            _store(session)
+            st.session_state.pop("new_project_mode", None)
+            st.session_state.pop("custom_intake", None)
+            st.rerun()
+        except Exception as exc:
+            print(f"[ui] 启动五层访谈失败：{type(exc).__name__}: {str(exc)[:160]}")
+            st.error("网络异常，项目创建失败，请检查网络")
+
+
+    def render_layer_entry() -> None:
+        """第一屏：载入场景 + 五层地图；默认不出现输入框。"""
+        if not st.session_state.get("wake_seen"):
+            st.info("正在唤醒，约 20 秒…")
+            st.session_state["wake_seen"] = True
+
+        scenarios = [
+            "我们每天下班前要人工汇总当天的不良品，太慢了",
+            "客户要的月度报表每次都要手工核对，经常对不上",
+            "出了质量问题要查是哪个批次、哪台设备做的，查半天",
+        ]
+        st.caption("先选一个最像客户原话的场景，或者自己描述一句：")
+        for index, quote in enumerate(scenarios):
+            if st.button(quote, use_container_width=True, key=f"scenario_{index}"):
+                _start_layer_session(quote)
+
+        if st.button("自己描述一个", use_container_width=True, key="custom_start"):
+            st.session_state["custom_intake"] = True
+        if st.session_state.get("custom_intake"):
+            custom = st.text_input(
+                "用一句大白话说说你想做什么",
+                key="custom_requirement",
+                placeholder="例如：我想做个记账网页",
+            )
+            if st.button("开始聊", type="primary", key="custom_submit"):
+                if len(custom.strip()) < 2:
+                    st.warning("再多说一句就行")
+                else:
+                    _start_layer_session(custom.strip())
+
+        st.divider()
+        render_layer_map(None)
+
+
+    def render_layer_intake() -> None:
+        """五层访谈主界面：一层一问；结束后先出确认单。"""
+        session = _session()
+        if (
+            session is None
+            or not session.layer_status
+            or st.session_state.get("new_project_mode")
+        ):
+            render_layer_entry()
+            return
+
+        for item in session.transcript[-12:]:
+            with st.chat_message("user" if item["role"] == "pm" else "assistant"):
+                st.write(item["content"])
+
+        if session.layer_index:
+            st.caption(
+                f"当前第 {session.layer_index} 层："
+                f"{decompose_logic.LAYER_NAMES.get(session.layer_index, '')}"
+            )
+            if session.pending_question:
+                prompt = st.chat_input("用大白话回答……")
+                if prompt:
+                    _handle_chat_message(session, prompt)
+
+            # 允许随时点“生成需求确认单”，用硬门禁验证；未满三层会直接拒绝
+            if st.button("生成需求确认单", key=f"gate_check_{session.layer_index}"):
+                try:
+                    sheet = session.build_confirmation_sheet()
+                    st.session_state["confirmation_sheet"] = sheet
+                except Exception as exc:
+                    st.error(_error_text(exc, "还不能生成，先把这一层聊完。"))
+            if st.session_state.get("confirmation_sheet"):
+                st.markdown(st.session_state["confirmation_sheet"])
+            return
+
+        ok, message = session.document_gate()
+        if not ok:
+            st.error(message)
+            return
+
+        sheet = session.build_confirmation_sheet()
+        st.markdown(sheet)
+        st.caption("先确认这五栏；确认无误再展开完整 PRD。")
+        if st.button("展开完整 PRD", type="primary", key="expand_prd"):
+            _quota_guard()
+            _begin_busy("prd")
+            ok = False
+            with st.status("正在展开完整 PRD...", expanded=True) as status:
+                try:
+                    session.ensure_outline_from_layers()
+                    path = session.generate_prd(progress=_status_progress(status))
+                    _store(session)
+                    st.session_state["tickets"] = list(session.generated_ticket_data)
+                    st.session_state["tickets_project_id"] = session.project_id
+                    status.update(label="完整 PRD 已生成", state="complete", expanded=False)
+                    ok = True
+                except Exception as exc:
+                    status.update(label="生成失败", state="error")
+                    st.error(_error_text(exc, "生成失败，请稍后重试"))
+                finally:
+                    _end_busy()
+            if ok:
+                st.rerun()
+
+
     # 首次加载：恢复最近项目；新建模式下不恢复，避免把用户拉回旧项目
     if "pm_session" not in st.session_state and not st.session_state.get("new_project_mode"):
         try:
@@ -481,6 +615,22 @@ try:
             st.session_state["new_project_mode"] = True
             st.rerun()
 
+        # 第一屏不出现任何输入框：只有已经进入某个项目后，才显示筛选
+        _filter_keyword = ""
+        _filter_period = "全部"
+        if _session() is not None and _session().layer_status:
+            with st.expander("筛选项目", expanded=False):
+                _filter_keyword = st.text_input(
+                    "按客户/行业筛选",
+                    key="project_filter_keyword",
+                    placeholder="输入客户名或行业关键词",
+                )
+                _filter_period = st.selectbox(
+                    "时间",
+                    ["全部", "近 7 天", "近 30 天"],
+                    key="project_filter_period",
+                )
+
         try:
             # 全局项目列表：访问码是唯一门禁，不再按浏览器会话隔离，
             # 否则关闭标签页 / 换浏览器后旧任务会“消失”。
@@ -488,6 +638,32 @@ try:
         except Exception:
             st.warning("项目列表暂时不可用，您仍可新建项目。")
             _projects = []
+
+        # 项目库筛选：客户/行业关键词 + 创建时间；只筛不改存储结构
+        if _filter_keyword.strip():
+            keyword = _filter_keyword.strip().lower()
+            _projects = [
+                item
+                for item in _projects
+                if keyword in str(item.get("name", "")).lower()
+                or keyword in str(item.get("requirement", "")).lower()
+            ]
+        if _filter_period != "全部":
+            days = 7 if _filter_period == "近 7 天" else 30
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            filtered = []
+            for item in _projects:
+                try:
+                    created = datetime.fromisoformat(
+                        str(item.get("created_at", "")).replace("Z", "+00:00")
+                    )
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    if created >= cutoff:
+                        filtered.append(item)
+                except Exception:
+                    filtered.append(item)
+            _projects = filtered
 
         # 新建模式下“（新建项目）”置顶；否则历史项目在前
         _project_ids = [item["id"] for item in _projects]
@@ -553,7 +729,9 @@ try:
                     print(f"[ui] 删除项目失败：{type(exc).__name__}: {str(exc)[:160]}")
                     st.error("删除失败，请稍后重试。")
 
-        st.caption("一次一问 · 结论先行 · 工单即状态")
+        st.divider()
+        render_layer_map(_session())
+        st.caption("一次一问 · 结论先行 · 五层聊透再出文档")
 
     # 顶部自定义 Header：三步进度 + 当前项目 + 阶段徽章（替代原生 st.title/st.caption）
     _header_session = _session()
@@ -582,8 +760,8 @@ try:
     # ① 需求与追问
     # =============================================================================
     with tab_ask:
-        # 对话式主界面：欢迎语、历史消息、快捷选项与 chat_input 都在同一个 fragment 内
-        render_chat()
+        # 五层问题地图：第一屏是地图与载入场景，不出现输入框
+        render_layer_intake()
 
     # =============================================================================
     # ② 大纲确认

@@ -158,8 +158,22 @@ _SECTION_LABELS: dict[str, str] = {
 }
 
 
+PRODUCT_PRINCIPLE = (
+    "这个产品不生产文档，它生产“客户把业务想明白了”这件事。文档是副产品。\n"
+    "每加一个功能，先问一句：这是不是在帮他“想明白”？不是，就别加。"
+)
+
+FDE_RULES: tuple[str, ...] = (
+    "五层顺序：①为什么存在 → ②现在怎么走 → ③数据从哪来 → ④谁在用 → ⑤边界，不跳层。",
+    "一次只问一层一个问题；下层不开启，上层不可跳。",
+    "客户答不上来记【待确认】，不替他编；说“不重要”记【已跳过】，允许继续。",
+    "跟客户说话只用：谁点头、在哪儿打开、谁在用、数据从哪拿、跟谁对接。",
+    "一次回答不超过四行，不解释原理，不总结上一轮。",
+)
+
+
 def build_system_prompt(task_prompt: str) -> str:
-    """把协作偏好 + 技术红线拼在任务提示词最前面（模块一硬性要求）。
+    """把总纲 + 协作偏好 + 技术红线拼在任务提示词最前面（模块一硬性要求）。
 
     参数 task_prompt：本次具体任务的系统提示词（追问 / 大纲 / 工单 / Fix）。
     返回：可直接作为 system content 传给百炼的完整规则前缀。
@@ -172,6 +186,10 @@ def build_system_prompt(task_prompt: str) -> str:
 
     return "\n".join(
         [
+            "===== 〇、总纲与五层问题地图（最高优先级，不可删）=====",
+            PRODUCT_PRINCIPLE,
+            *[f"- {item}" for item in FDE_RULES],
+            "",
             "===== 一、协作对象与协作偏好（最高优先级，必须遵守）=====",
             *profile_lines,
             "",
@@ -217,6 +235,10 @@ def build_prd_system_prompt(task_prompt: str) -> str:
     profile_lines = [f"- {key}：{value}" for key, value in USER_PROFILE.items()]
     return "\n".join(
         [
+            "===== 〇、总纲与五层问题地图（最高优先级，不可删）=====",
+            PRODUCT_PRINCIPLE,
+            *[f"- {item}" for item in FDE_RULES],
+            "",
             "===== 一、协作对象与协作偏好（最高优先级，必须遵守）=====",
             *profile_lines,
             "",
